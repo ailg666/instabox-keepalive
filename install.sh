@@ -8,7 +8,8 @@
 #
 # Env / flags (flags win):
 #   key= / KEY= / INSTABOX_API_KEY=   api key (required)
-#   machine= / INSTABOX_MACHINE=      box name or m_... id (required)
+#   machine= / INSTABOX_MACHINE=      box name or m_... id; 留空 / all = 保活这把
+#                                     key 能看到的每一台（有几台保几台）
 #   --lease NAME      lease name                  (default keepalive)
 #   --ttl SECONDS     lease ttl, 30-3600          (default 300)
 #   --dir PATH        install dir                 (default /root/instabox-keepalive)
@@ -67,7 +68,9 @@ EOF
 fi
 
 [ -n "$API_KEY" ] || die "缺少 key（key=ibk_... 或 --key 之前用环境变量传入）"
-[ -n "$NAME" ]    || die "缺少 machine（machine=qqq）"
+if [ -n "$NAME" ]; then
+	case "$NAME" in all|ALL|'*') NAME="" ;; esac
+fi
 case "$TTL" in ''|*[!0-9]*) die "ttl 必须是数字" ;; esac
 [ "$TTL" -ge 30 ] && [ "$TTL" -le 3600 ] || die "ttl 必须在 30-3600 秒之间"
 
@@ -188,7 +191,7 @@ cat <<EOF
 
   安装完成
     目录   $DIR          （.env 权限 600，key 不落仓库、不进进程列表）
-    机器   $NAME
+    机器   ${NAME:-全部（按 key 自动发现，有几台保几台）}
     租约   $LEASE，ttl ${TTL}s
     key    $(mask "$API_KEY")
     卸载   sh $DIR/uninstall.sh
