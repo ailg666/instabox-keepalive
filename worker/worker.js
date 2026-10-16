@@ -5,11 +5,16 @@
 // Variables: INSTABOX_API_KEY (加密), TOKEN, INSTABOX_MACHINE (留空=全部机器) →
 // Triggers → Cron: */4 * * * * → Deploy.
 //
-//   GET /                     续租一次（手动触发）
+//   GET /                     续租一次（手动触发，必写一条日志）
 //   GET /status               机器状态
 //   GET /log                  最近 48 条保活日志（需要 KV 绑定 LOG）
 //   GET /release              放掉租约
 // 都要带 ?token=...（设了 TOKEN 变量时）；可加 &format=text 看纯文本。
+//
+// 变量 INSTABOX_LOG_MODE 控制写 KV 的频次（免费额度 1000 次写/天）：
+//   hourly（默认）同一小时的连续成功只写 1 条 ≈24 次/天，失败立刻记
+//   every  每次续租都写（*/9 = 160 次/天，仍在额度内）
+//   off    完全不写 KV，/log 会是空的
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 300;
@@ -23,6 +28,8 @@ function cfg(env) {
     lease: env.INSTABOX_LEASE || LEASE_DEFAULT,
     ttl: Number.isFinite(ttl) && ttl >= 30 && ttl <= 3600 ? ttl : TTL_DEFAULT,
     kv: env.LOG || null,
+    // hourly（默认）：同一小时的“成功”不重复写 KV，省额度；every：每次都写；off：不写
+    logMode: (env.INSTABOX_LOG_MODE || "hourly").trim(),
   };
 }
 
@@ -64,10 +71,15 @@ async function machines(c) {
 }
 
 // 保活日志：绑了 KV（变量名 LOG）就留最近 48 条，没绑也能用，只是 /log 空
-async function logEvent(c, entry) {
-  if (!c.kv) return;
+// hourly 模式下同一小时的连续成功只写 1 次（KV 免费额度每天 1000 次写），失败照样立刻记
+async function logEvent(c, entry, force) {
+  if (!c.kv || c.logMode === "off") return;
   try {
     const arr = JSON.parse((await c.kv.get("log")) || "[]");
+    const last = arr[0];
+    if (!force && c.logMode === "hourly" && entry.ok && last && String(last.at).slice(0, 13) === entry.at.slice(0, 13)) {
+      return;
+    }
     arr.unshift(entry);
     await c.kv.put("log", JSON.stringify(arr.slice(0, 48)), {
       expirationTtl: 604800,
@@ -77,7 +89,7 @@ async function logEvent(c, entry) {
   }
 }
 
-async function keepalive(c) {
+async function keepalive(c, forceLog) {
   if (!c.key) return { ok: false, error: "缺 INSTABOX_API_KEY" };
   const list = await machines(c);
   if (!list.length) {
@@ -105,7 +117,7 @@ async function keepalive(c) {
     count: results.length,
     machines: results,
   };
-  await logEvent(c, out);
+  await logEvent(c, out, forceLog);
   return out;
 }
 
@@ -128,7 +140,7 @@ export default {
     const route = url.pathname.replace(/\/+$/, "") || "/";
 
     if (route === "/") {
-      const out = await keepalive(c);
+      const out = await keepalive(c, true);   // 手动触发不给去重，一定出现在 /log
       return reply(out, out.ok ? 200 : 502, asText);
     }
 

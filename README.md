@@ -71,10 +71,24 @@ sh /root/instabox-keepalive/uninstall.sh             # 彻底卸载（停服务�
    | `TOKEN` | Secret（自己起一串随机值） | 之后所有请求都要带 `?token=` |
    | `INSTABOX_MACHINE` | Text | 留空 = 保活全部机器；填 `qqq` 只保一台 |
    | `INSTABOX_LEASE_TTL` | Text | `300`（可选） |
+   | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
 
    > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
+   > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 9 分钟就填 `900`，填 `300` 会在两次续租之间出现空窗。
 4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/4 * * * *`（每 4 分钟）→ 保存。这就是自动保活的开关
 5. 想看 `/log`：`Storage & Databases` → `KV` → `Create namespace`，然后在 Worker 的 `Settings` → `Bindings` 里加一个 KV 绑定，**变量名填 `LOG`**、选刚建的空间。不绑也能用，只是 `/log` 是空的
+
+**KV 额度够不够**
+
+免费版 KV 每天 1000 次写、10 万次读。默认 `hourly` 模式下，同一小时的连续成功只写 1 条：每天约 24 次写（失败会立刻写，不受去重影响），占额度 2.4%，怎么跑都不会满。手动 `/?token=` 触发一定写日志，不参与去重。
+
+| cron 间隔 | 次数/天 | `every` 模式写/天 | `hourly` 模式写/天 |
+| --- | --- | --- | --- |
+| `*/9` | 160 | 160 | ~24 |
+| `*/4` | 360 | 360 | ~24 |
+| `* * * * *` | 1440 | **1440（超了）** | ~24 |
+
+也就是说：间隔 4 分钟以上用默认值随便跑；间隔 1 分钟的 `every` 会超额度，这时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
 
 **CLI 部署（可选）**
 

@@ -3,6 +3,7 @@ main = "worker.js"
 compatibility_date = "2026-10-16"
 
 # 每 4 分钟续一次 5 分钟的租约（cron 最小粒度 1 分钟）
+# 注意 TTL 必须大于 cron 间隔，否则两次续租之间会空窗：间隔 9 分钟就填 900
 [triggers]
 crons = ["*/4 * * * *"]
 
@@ -12,6 +13,8 @@ crons = ["*/4 * * * *"]
 INSTABOX_MACHINE = ""
 INSTABOX_LEASE = "keepalive"
 INSTABOX_LEASE_TTL = "300"
+# 写 KV 的频次，免费额度每天 1000 次写：hourly 每小时最多 1 条（~24/天）、every 每次都写、off 不写
+INSTABOX_LOG_MODE = "hourly"
 # TOKEN = "换成一串随机值，所有请求都要带 ?token=..."
 
 # 想看 /log 就绑一个 KV（dashboard: Storage & Databases → KV → 建一个 → 变量名填 LOG）
