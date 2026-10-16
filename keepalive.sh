@@ -86,33 +86,36 @@ for m in d.get("machines") or []:
     print("%s\t%s" % (m.get("id", ""), m.get("name", "")))'
 	else
 		printf '%s' "$HTTP_BODY" | awk '
-			function getv(o, k, s, r) {
+			function getv(o, k,   s, r) {
 				s = index(o, "\"" k "\":\"")
-				if (s == 0) return ""
-				r = substr(o, s + length(k) + 3)
+				if (s == 0) { return "" }
+				r = substr(o, s + length(k) + 4)
 				return substr(r, 1, index(r, "\"") - 1)
 			}
-			function emit(o, id) {
+			function emit(o,   id, nm) {
 				id = getv(o, "id")
-				if (id != "") print id "\t" getv(o, "name")
+				nm = getv(o, "name")
+				if (id != "") { print id "	" nm }
 			}
 			{
 				line = $0
 				i = index(line, "\"machines\":[")
-				if (i > 0) line = substr(line, i + 12)
-				if (length(line) > 1 && substr(line, length(line) - 1, 2) == "]}")
-					line = substr(line, 1, length(line) - 2)
-				depth = 0; buf = ""
+				if (i > 0) { line = substr(line, i + 12) } else { line = "" }
+				depth = 0; buf = ""; started = 0
 				for (p = 1; p <= length(line); p++) {
 					c = substr(line, p, 1)
+					if (c == "]") { if (depth == 0 && started == 1) { break } }
 					if (c == "{") {
 						depth++
-						if (depth == 1) buf = "{" else buf = buf c
-					} else if (c == "}") {
-						if (depth == 1) { emit(buf "}"); buf = "" }
-						else buf = buf c
-						depth--
-					} else if (depth >= 1) buf = buf c
+						if (depth == 1) { buf = "{"; started = 1 } else { buf = buf c }
+					} else {
+						if (c == "}") {
+							if (depth == 1) { emit(buf "}"); buf = "" } else { if (depth > 1) { buf = buf c } }
+							depth--
+						} else {
+							if (depth >= 1) { buf = buf c }
+						}
+					}
 				}
 			}'
 	fi

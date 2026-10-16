@@ -1,29 +1,28 @@
-// InstaBox keepalive on Cloudflare Workers — renews an activity lease from a
-// cron trigger, so no machine of your own has to stay up doing it.
+// InstaBox keepalive on Cloudflare Workers — renews activity leases from a cron
+// trigger, so no machine of your own has to stay up doing it.
 //
-//   npx wrangler secret put INSTABOX_API_KEY     # ibk_...  (never in wrangler.toml)
-//   npx wrangler deploy
+// Dashboard deploy (no CLI): Workers → Create → paste this file → Settings →
+// Variables: INSTABOX_API_KEY (加密), TOKEN, INSTABOX_MACHINE (留空=全部机器) →
+// Triggers → Cron: */4 * * * * → Deploy.
 //
-// Manual use (TOKEN is optional; set it to keep the URL non-public):
-//   curl "https://instabox-keepalive.<you>.workers.dev/?token=..."            renew
-//   curl "https://instabox-keepalive.<you>.workers.dev/status?token=..."      machine state
-//   curl "https://instabox-keepalive.<you>.workers.dev/release?token=..."     drop the lease
-//
-// Vars: INSTABOX_API_URL, INSTABOX_MACHINE, INSTABOX_LEASE, INSTABOX_LEASE_TTL
-
-const DEFAULT_API = "https://api.instabox.sh";
-const DEFAULT_LEASE = "keepalive";
-const DEFAULT_TTL = 300; // 30-3600
+//   GET /                     续租一次（手动触发）
+//   GET /status               机器状态
+//   GET /log                  最近 48 条保活日志（需要 KV 绑定 LOG）
+//   GET /release              放掉租约
+// 都要带 ?token=...（设了 TOKEN 变量时）；可加 &format=text 看纯文本。
+const API_DEFAULT = "https://api.instabox.sh";
+const LEASE_DEFAULT = "keepalive";
+const TTL_DEFAULT = 300;
 
 function cfg(env) {
-  const ttl = Number.parseInt(env.INSTABOX_LEASE_TTL ?? DEFAULT_TTL, 10);
-  const machine = (env.INSTABOX_MACHINE || "").trim();
+  const ttl = Number.parseInt(env.INSTABOX_LEASE_TTL ?? TTL_DEFAULT, 10);
   return {
-    api: (env.INSTABOX_API_URL || DEFAULT_API).replace(/\/+$/, ""),
+    api: (env.INSTABOX_API_URL || API_DEFAULT).replace(/\/+$/, ""),
     key: env.INSTABOX_API_KEY || "",
-    machine,
-    lease: env.INSTABOX_LEASE || DEFAULT_LEASE,
-    ttl: Number.isFinite(ttl) && ttl >= 30 && ttl <= 3600 ? ttl : DEFAULT_TTL,
+    machine: (env.INSTABOX_MACHINE || "").trim(),
+    lease: env.INSTABOX_LEASE || LEASE_DEFAULT,
+    ttl: Number.isFinite(ttl) && ttl >= 30 && ttl <= 3600 ? ttl : TTL_DEFAULT,
+    kv: env.LOG || null,
   };
 }
 
@@ -37,100 +36,178 @@ async function call(c, method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
-  let json;
+  let json = null;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
-  }
+  } catch {}
   return { ok: res.ok, status: res.status, json, text };
 }
 
-// The lease routes take a machine id; a name works on GET /v1/machines/{id}, so
-// a name is resolved once per isolate and cached for ten minutes.
-let idCache = { name: "", id: "", at: 0 };
+// 机器列表：填了名字/id 就那一台，留空=这把 key 名下全部（isolate 内缓存 10 分钟）
+let cache = { key: "", list: [], at: 0 };
 
-async function machineId(c) {
-  if (c.machine.startsWith("m_")) return c.machine;
+async function machines(c) {
   const now = Date.now();
-  if (idCache.name === c.machine && now - idCache.at < 600_000) return idCache.id;
-  const r = await call(c, "GET", `/v1/machines/${c.machine}`);
-  if (!r.ok || !r.json?.id) return null;
-  idCache = { name: c.machine, id: r.json.id, at: now };
-  return idCache.id;
+  if (cache.key === c.machine && now - cache.at < 600_000) return cache.list;
+  let list = [];
+  if (c.machine.startsWith("m_")) {
+    list = [{ id: c.machine, name: c.machine }];
+  } else if (c.machine) {
+    const r = await call(c, "GET", `/v1/machines/${c.machine}`);
+    if (r.ok && r.json?.id) list = [{ id: r.json.id, name: r.json.name || c.machine }];
+  } else {
+    const r = await call(c, "GET", "/v1/machines");
+    if (r.ok) list = (r.json?.machines || []).map((m) => ({ id: m.id, name: m.name }));
+  }
+  cache = { key: c.machine, list, at: now };
+  return list;
 }
 
-const renew = (c, id) =>
-  call(c, "PUT", `/v1/machines/${id}/activity-leases/${c.lease}`, {
-    ttlSeconds: c.ttl,
-  });
+// 保活日志：绑了 KV（变量名 LOG）就留最近 48 条，没绑也能用，只是 /log 空
+async function logEvent(c, entry) {
+  if (!c.kv) return;
+  try {
+    const arr = JSON.parse((await c.kv.get("log")) || "[]");
+    arr.unshift(entry);
+    await c.kv.put("log", JSON.stringify(arr.slice(0, 48)), {
+      expirationTtl: 604800,
+    });
+  } catch (e) {
+    console.log("instabox-keepalive: 写日志失败", e.message);
+  }
+}
 
 async function keepalive(c) {
-  if (!c.key || !c.machine) {
-    return { ok: false, error: "缺 INSTABOX_API_KEY 或 INSTABOX_MACHINE" };
+  if (!c.key) return { ok: false, error: "缺 INSTABOX_API_KEY" };
+  const list = await machines(c);
+  if (!list.length) {
+    return {
+      ok: false,
+      error: c.machine ? `找不到机器 ${c.machine}（或 key 没权限）` : "这把 key 名下没有机器",
+    };
   }
-  const id = await machineId(c);
-  if (!id) return { ok: false, error: `找不到机器 ${c.machine}（或这把 key 没权限）` };
-  const r = await renew(c, id);
-  if (!r.ok) {
-    return { ok: false, error: `续租失败 HTTP ${r.status}`, body: r.text.slice(0, 500) };
+  const results = [];
+  for (const m of list) {
+    const r = await call(c, "PUT", `/v1/machines/${m.id}/activity-leases/${c.lease}`, {
+      ttlSeconds: c.ttl,
+    });
+    results.push(
+      r.ok
+        ? { machine: m.name, id: m.id, ok: true, expiresAt: r.json?.expiresAt }
+        : { machine: m.name, id: m.id, ok: false, status: r.status, error: r.text.slice(0, 200) },
+    );
   }
-  return {
-    ok: true,
-    machine: c.machine,
-    id,
+  const out = {
+    ok: results.every((r) => r.ok),
+    at: new Date().toISOString(),
     lease: c.lease,
     ttl: c.ttl,
-    expiresAt: r.json?.expiresAt,
+    count: results.length,
+    machines: results,
   };
+  await logEvent(c, out);
+  return out;
 }
 
 export default {
-  // Cron trigger (see wrangler.toml). Runs on Cloudflare, touches nothing local.
   async scheduled(_event, env, ctx) {
-    const c = cfg(env);
-    const out = await keepalive(c);
-    if (!out.ok) console.error("instabox-keepalive:", out.error, out.body ?? "");
-    else console.log("instabox-keepalive:", JSON.stringify(out));
+    const out = await keepalive(cfg(env));
+    if (out.ok) console.log("instabox-keepalive:", JSON.stringify(out));
+    else console.error("instabox-keepalive:", JSON.stringify(out));
     ctx.waitUntil(Promise.resolve());
   },
 
   async fetch(request, env) {
     const c = cfg(env);
     const url = new URL(request.url);
+    const asText = url.searchParams.get("format") === "text";
     if (env.TOKEN && url.searchParams.get("token") !== env.TOKEN) {
-      return json({ ok: false, error: "token 不对" }, 401);
+      return reply({ ok: false, error: "token 不对" }, 401, asText);
     }
 
-    const action = url.pathname.replace(/\/+$/, "") || "/";
-    if (action === "/") {
+    const route = url.pathname.replace(/\/+$/, "") || "/";
+
+    if (route === "/") {
       const out = await keepalive(c);
-      return json(out, out.ok ? 200 : 502);
+      return reply(out, out.ok ? 200 : 502, asText);
     }
-    if (action === "/status") {
-      const r = await call(c, "GET", `/v1/machines/${c.machine}`);
-      if (!r.ok) return json({ ok: false, error: `HTTP ${r.status}` }, 502);
-      return json({
-        ok: true,
-        name: r.json?.name,
-        state: r.json?.state,
-        autoSuspendAfterSeconds: r.json?.autoSuspendAfterSeconds,
-        autoSuspendedAt: r.json?.autoSuspendedAt ?? null,
-      });
+
+    if (route === "/status") {
+      if (!c.key) return reply({ ok: false, error: "缺 INSTABOX_API_KEY" }, 502, asText);
+      const list = await machines(c);
+      if (!list.length) return reply({ ok: false, error: "没有机器" }, 502, asText);
+      const machinesOut = [];
+      for (const m of list) {
+        const r = await call(c, "GET", `/v1/machines/${m.id}`);
+        machinesOut.push(
+          r.ok
+            ? {
+                name: m.name,
+                state: r.json?.state,
+                autoSuspendAfterSeconds: r.json?.autoSuspendAfterSeconds,
+                autoSuspendedAt: r.json?.autoSuspendedAt ?? null,
+              }
+            : { name: m.name, error: `HTTP ${r.status}` },
+        );
+      }
+      return reply({ ok: true, count: machinesOut.length, machines: machinesOut }, 200, asText);
     }
-    if (action === "/release") {
-      const id = await machineId(c);
-      if (!id) return json({ ok: false, error: `找不到机器 ${c.machine}` }, 502);
-      const r = await call(c, "DELETE", `/v1/machines/${id}/activity-leases/${c.lease}`);
-      const ok = r.ok || r.status === 404;
-      return json({ ok, status: r.status }, ok ? 200 : 502);
+
+    if (route === "/log") {
+      const raw = c.kv ? await c.kv.get("log") : null;
+      const entries = raw ? JSON.parse(raw) : [];
+      return reply(
+        {
+          ok: true,
+          storage: c.kv ? "KV 已绑定，保留最近 48 次（7 天）" : "未绑定 KV（变量 LOG），/log 为空",
+          count: entries.length,
+          entries,
+        },
+        200,
+        asText,
+      );
     }
-    return json({ ok: false, error: "用 / 续租、/status 看状态、/release 放租约" }, 404);
+
+    if (route === "/release") {
+      const list = await machines(c);
+      const out = [];
+      for (const m of list) {
+        const r = await call(c, "DELETE", `/v1/machines/${m.id}/activity-leases/${c.lease}`);
+        out.push({ machine: m.name, ok: r.ok || r.status === 404, status: r.status });
+      }
+      const ok = out.length > 0 && out.every((r) => r.ok);
+      return reply({ ok, machines: out }, ok ? 200 : 502, asText);
+    }
+
+    return reply(
+      { ok: false, error: "用 / 续租、/status 状态、/log 日志、/release 放租约" },
+      404,
+      asText,
+    );
   },
 };
 
-const json = (body, status = 200) =>
-  new Response(JSON.stringify(body, null, 2), {
+function reply(body, status, asText) {
+  if (asText) {
+    const lines = [`ok=${body.ok}`];
+    if (body.error) lines.push(`error=${body.error}`);
+    for (const m of body.machines || []) {
+      lines.push(
+        [m.machine || m.name, m.ok === false ? "FAIL" : "ok", m.expiresAt || m.state || m.status || ""]
+          .filter(Boolean)
+          .join(" "),
+      );
+    }
+    for (const e of body.entries || []) {
+      lines.push(`${e.at} ok=${e.ok} 续租 ${e.count} 台`);
+    }
+    return new Response(lines.join("\n") + "\n", {
+      status,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+  return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
+}

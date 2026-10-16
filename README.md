@@ -57,7 +57,26 @@ sh /root/instabox-keepalive/uninstall.sh             # 彻底卸载（停服务�
 
 ## Cloudflare Worker 方案
 
-不想为这件事常开一台机器，可以把续租放到 Worker 上（`worker/` 目录，cron 每 4 分钟跑一次，和你自己的机器无关）：
+不想为这件事常开一台机器，可以把续租放到 Worker 上（`worker/` 目录，cron 每 4 分钟跑一次，和你自己的机器无关）。
+
+**网页面板部署（推荐，不用装 wrangler）**
+
+1. Cloudflare 面板 → `Workers & Pages` → `Create` → `Worker` → 起个名字（例如 `instabox-keepalive`）→ `Deploy`
+2. `Edit code`，把 `worker/worker.js` 的内容整段粘进去（覆盖默认代码）→ `Deploy`
+3. `Settings` → `Variables and Secrets`，加这几条：
+
+   | 变量 | 类型 | 值 |
+   | --- | --- | --- |
+   | `INSTABOX_API_KEY` | **Secret（加密）** | 你的 `ibk_...` |
+   | `TOKEN` | Secret（自己起一串随机值） | 之后所有请求都要带 `?token=` |
+   | `INSTABOX_MACHINE` | Text | 留空 = 保活全部机器；填 `qqq` 只保一台 |
+   | `INSTABOX_LEASE_TTL` | Text | `300`（可选） |
+
+   > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
+4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/4 * * * *`（每 4 分钟）→ 保存。这就是自动保活的开关
+5. 想看 `/log`：`Storage & Databases` → `KV` → `Create namespace`，然后在 Worker 的 `Settings` → `Bindings` 里加一个 KV 绑定，**变量名填 `LOG`**、选刚建的空间。不绑也能用，只是 `/log` 是空的
+
+**CLI 部署（可选）**
 
 ```sh
 cd worker
@@ -65,7 +84,17 @@ npx wrangler secret put INSTABOX_API_KEY    # key 只进 secret，不写进 wran
 npx wrangler deploy
 ```
 
-手动触发：`GET /` 续租、`GET /status` 看状态、`GET /release` 放租约；把 `TOKEN` 变量设上就要求 `?token=...`。Worker 版目前按 `INSTABOX_MACHINE` 保活单台（要全部机器就用 shell 版，或把 `INSTABOX_MACHINE` 逐台配上）。
+**域名 + token 手动触发**
+
+```
+https://<你的worker>.workers.dev/?token=xxx              续租一次，看结果
+https://<你的worker>.workers.dev/status?token=xxx        机器状态
+https://<你的worker>.workers.dev/log?token=xxx           最近 48 条保活日志
+https://<你的worker>.workers.dev/log?token=xxx&format=text   纯文本，方便 grep
+https://<你的worker>.workers.dev/release?token=xxx       放掉租约
+```
+
+`?token=` 就是上面那个 `TOKEN` 变量；设了就必须带，不带返回 `401 token 不对`。不带 `format=text` 时返回 JSON。cron 跑的结果和 `/` 一样，也写进 `/log`（绑了 KV 才有），每条记着时间、租约、几台、每台到期时间。
 
 ## 密钥安全
 
