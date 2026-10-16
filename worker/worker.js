@@ -46,8 +46,22 @@ async function call(c, method, path, body) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-const renew = (c) =>
-  call(c, "PUT", `/v1/machines/${c.machine}/activity-leases/${c.lease}`, {
+// The lease routes take a machine id; a name works on GET /v1/machines/{id}, so
+// a name is resolved once per isolate and cached for ten minutes.
+let idCache = { name: "", id: "", at: 0 };
+
+async function machineId(c) {
+  if (c.machine.startsWith("m_")) return c.machine;
+  const now = Date.now();
+  if (idCache.name === c.machine && now - idCache.at < 600_000) return idCache.id;
+  const r = await call(c, "GET", `/v1/machines/${c.machine}`);
+  if (!r.ok || !r.json?.id) return null;
+  idCache = { name: c.machine, id: r.json.id, at: now };
+  return idCache.id;
+}
+
+const renew = (c, id) =>
+  call(c, "PUT", `/v1/machines/${id}/activity-leases/${c.lease}`, {
     ttlSeconds: c.ttl,
   });
 
@@ -55,11 +69,20 @@ async function keepalive(c) {
   if (!c.key || !c.machine) {
     return { ok: false, error: "缺 INSTABOX_API_KEY 或 INSTABOX_MACHINE" };
   }
-  const r = await renew(c);
+  const id = await machineId(c);
+  if (!id) return { ok: false, error: `找不到机器 ${c.machine}（或这把 key 没权限）` };
+  const r = await renew(c, id);
   if (!r.ok) {
     return { ok: false, error: `续租失败 HTTP ${r.status}`, body: r.text.slice(0, 500) };
   }
-  return { ok: true, machine: c.machine, lease: c.lease, ttl: c.ttl, expiresAt: r.json?.expiresAt };
+  return {
+    ok: true,
+    machine: c.machine,
+    id,
+    lease: c.lease,
+    ttl: c.ttl,
+    expiresAt: r.json?.expiresAt,
+  };
 }
 
 export default {
@@ -96,7 +119,9 @@ export default {
       });
     }
     if (action === "/release") {
-      const r = await call(c, "DELETE", `/v1/machines/${c.machine}/activity-leases/${c.lease}`);
+      const id = await machineId(c);
+      if (!id) return json({ ok: false, error: `找不到机器 ${c.machine}` }, 502);
+      const r = await call(c, "DELETE", `/v1/machines/${id}/activity-leases/${c.lease}`);
       const ok = r.ok || r.status === 404;
       return json({ ok, status: r.status }, ok ? 200 : 502);
     }
