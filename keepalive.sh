@@ -1,50 +1,93 @@
 #!/bin/sh
-# InstaBox keepalive — renew activity leases so a box never idle-suspends.
+# InstaBox keepalive — 续租 activity lease，机器就不会因为空闲被自动挂起。
 #
-# Pure POSIX sh (Alpine/BusyBox, Debian, Ubuntu, OpenWrt…), needs only curl.
-# Nothing runs inside the box: a suspended machine freezes its own timers, so
-# the renewal must come from outside over the network.
+# 一个文件搞定安装 / 续租 / 卸载，纯 POSIX sh（Alpine/BusyBox、Debian、OpenWrt），只依赖 curl。
 #
-#   ./keepalive.sh              loop forever, renewing before the lease expires
-#   ./keepalive.sh --once       renew once, exit 0/1 (use from cron)
-#   ./keepalive.sh --status     print machine state + auto-suspend settings
-#   ./keepalive.sh --release    drop the lease, restoring normal idle suspend
+#   安装（key 只写进本机 0600 的 .env，绝不落仓库、不进进程列表）
+#     key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+#     machine=qqq 只保一台；machine= 留空 / all = 保活这把 key 名下全部机器
 #
-# A `.env` sitting next to this file is sourced first, so a service can keep the
-# key out of the process list. The environment always wins over `.env`.
+#   卸载
+#     sh keepalive.sh uninstall                 （--keep-files 保留目录 / --keep-lease 不动租约）
 #
-#   INSTABOX_API_KEY      required   ibk_...      (aliases: key, KEY, IBK)
-#   INSTABOX_MACHINE      optional   qqq | m_...  (alias: machine)
-#                                    empty / all / * = every machine the key sees
-#   INSTABOX_LEASE        keepalive  lease name — renewing a name extends it
-#   INSTABOX_LEASE_TTL    300        30-3600 seconds
-#   INSTABOX_RENEW_EVERY  0.6 x ttl  seconds between renewals
-#   INSTABOX_API_URL      https://api.instabox.sh
+#   手动用
+#     sh keepalive.sh --once       续租一次，退出码 0/1（cron 用这个）
+#     sh keepalive.sh --watch      前台常驻（systemd / OpenRC 用这个）
+#     sh keepalive.sh --status     机器状态
+#     sh keepalive.sh --release    释放租约，恢复正常空闲挂起
+#
+#   安装参数（也能写成环境变量）
+#     key= / KEY= / INSTABOX_API_KEY=  API key（必填）
+#     machine= / INSTABOX_MACHINE=     机器名或 m_... id；留空 / all = 全部
+#     --lease NAME     租约名                    （默认 keepalive）
+#     --ttl SECONDS    租约秒数 30-3600          （默认 300）
+#     --dir PATH       安装目录                  （默认 /root/instabox-keepalive）
+#     --service NAME   服务名                    （默认 instabox-keepalive）
+#     --raw URL        raw 前缀，脚本自更新用     （默认本仓库 main）
+#     --no-start       只装不启
+#     --cron           强制走 cron（不用 systemd / OpenRC）
+#
+#   运行期变量（.env 或环境变量；环境变量优先）
+#     INSTABOX_ENV_FILE      .env 路径（默认脚本同目录）
+#     INSTABOX_RENEW_EVERY   两次续租的间隔秒数（默认租约的 3/5）
+#     INSTABOX_API_URL       API 地址（默认 https://api.instabox.sh）
+#
+# 机器被挂起后机器内部的定时器也会冻结，所以续租必须从机器外面打进来。
 set -u
 
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ENV_FILE=${INSTABOX_ENV_FILE:-$SELF_DIR/.env}
-# shellcheck disable=SC1090
-[ -f "$ENV_FILE" ] && . "$ENV_FILE"
-
-API=${INSTABOX_API_URL:-${api:-https://api.instabox.sh}}
-KEY=${INSTABOX_API_KEY:-${key:-${KEY:-${IBK:-}}}}
-MACHINE=${INSTABOX_MACHINE:-${machine:-}}
+RAW=${RAW_BASE:-https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main}
+DEF_DIR=${INSTALL_DIR:-/root/instabox-keepalive}
+DIR=$DEF_DIR
+SERVICE=${SERVICE_NAME:-instabox-keepalive}
 LEASE=${INSTABOX_LEASE:-keepalive}
 TTL=${INSTABOX_LEASE_TTL:-300}
-RENEW=${INSTABOX_RENEW_EVERY:-$((TTL * 3 / 5))}
-ALL=0
-case "$MACHINE" in ""|all|ALL|All|'*') ALL=1 ;; esac
+NAME=${machine:-${INSTABOX_MACHINE:-}}
+API_KEY=${key:-${KEY:-${IBK:-${INSTABOX_API_KEY:-}}}}
+API=${INSTABOX_API_URL:-${api:-https://api.instabox.sh}}
+WANT_START=1
+FORCE_CRON=0
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo /nonexistent)
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+say() { printf '  %s\n' "$*"; }
+die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+mask() {
+	v=$1
+	n=${#v}
+	if [ "$n" -le 12 ]; then
+		printf '%s' "$v"
+	else
+		printf '%s……%s' "$(printf %s "$v" | cut -c1-8)" "$(printf %s "$v" | cut -c$((n - 3))-$n)"
+	fi
+}
+
+# ---- 运行时：读 .env、调 API、续租 ------------------------------------------
+load_env() { # load_env [题目录]
+	d=$1
+	ENV_FILE=${INSTABOX_ENV_FILE:-$d/.env}
+	# shellcheck disable=SC1090
+	[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+	return 0
+}
+
+reload_runtime() { # .env / 环境变量里的值最终生效一次
+	API=${INSTABOX_API_URL:-${api:-$API}}
+	KEY=${INSTABOX_API_KEY:-${key:-${KEY:-${IBK:-${KEY:-}}}}}
+	MACHINE=${INSTABOX_MACHINE:-${machine:-$NAME}}
+	LEASE=${INSTABOX_LEASE:-$LEASE}
+	TTL=${INSTABOX_LEASE_TTL:-$TTL}
+	RENEW=${INSTABOX_RENEW_EVERY:-$((TTL * 3 / 5))}
+	ALL=0
+	case "$MACHINE" in ""|all|ALL|All|'*') ALL=1 ;; esac
+	return 0
+}
 
 HTTP_BODY=
 HTTP_CODE=
 
-log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-die() { log "错误: $*" >&2; exit 1; }
 
-command -v curl >/dev/null 2>&1 || die "缺 curl（Alpine: apk add curl / Debian: apt-get install -y curl）"
-
-# jget <json> <key> -> leftmost value of "key":…, unquoted
+# jget <json> <key> -> "key":… 里最左边那个值，去引号
 jget() {
 	printf '%s' "$1" | awk -v k="$2" '
 		match($0, "\"" k "\":[^,}]*") {
@@ -57,7 +100,9 @@ jget() {
 
 # http <METHOD> <PATH> [JSON_BODY] -> HTTP_CODE + HTTP_BODY
 http() {
-	local method=$1 path=$2 data=${3:-} resp
+	method=$1
+	path=$2
+	data=${3:-}
 	if [ -n "$data" ]; then
 		resp=$(curl -sS -m 30 -X "$method" "$API$path" \
 			-H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
@@ -71,11 +116,10 @@ http() {
 	[ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]
 }
 
-# The lease routes take a machine id only; names work on GET /v1/machines/{id},
-# so a name is turned into its id once, and `all` lists everything the key sees.
-# jq and python3 are used when present; the awk fallback walks brace depth so it
-# works on a bare BusyBox.
-machines_list() { # -> "id<TAB>name" per line
+# 租约接口只认机器 id（传名字会 400），所以名字要先换成 id；`all` 就是把这把 key
+# 能看到的机器全列出来。jq / python3 有就用，都没有就走 awk——按花括号深度扫，
+# 裸 BusyBox 也能跑。
+machines_list() { # -> 每行 "id<TAB>name"
 	if command -v jq >/dev/null 2>&1; then
 		printf '%s' "$HTTP_BODY" | jq -r '.machines[]? | "\(.id)\t\(.name)"'
 	elif command -v python3 >/dev/null 2>&1; then
@@ -95,7 +139,7 @@ for m in d.get("machines") or []:
 			function emit(o,   id, nm) {
 				id = getv(o, "id")
 				nm = getv(o, "name")
-				if (id != "") { print id "	" nm }
+				if (id != "") { print id "\t" nm }
 			}
 			{
 				line = $0
@@ -122,9 +166,7 @@ for m in d.get("machines") or []:
 }
 
 resolve() {
-	if [ "$ALL" -eq 1 ]; then
-		return 0
-	fi
+	[ "$ALL" -eq 1 ] && return 0
 	case "$MACHINE" in
 		m_*) MID=$MACHINE; LABEL=$MACHINE; return 0 ;;
 	esac
@@ -136,6 +178,7 @@ resolve() {
 }
 
 preflight() {
+	command -v curl >/dev/null 2>&1 || die "缺 curl（Alpine: apk add curl / Debian: apt-get install -y curl）"
 	[ -n "$KEY" ] || die "未设置 INSTABOX_API_KEY（或 key=…）"
 	if [ "$ALL" -eq 0 ]; then
 		[ -n "$MACHINE" ] || die "未设置 INSTABOX_MACHINE（填名字、填 all、或留空表示全部）"
@@ -180,7 +223,7 @@ autoSuspendedAt=$(jget "$HTTP_BODY" autoSuspendedAt)"
 	return 0
 }
 
-each_machine() { # each_machine <fn> -- run fn on the selected machine(s)
+each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 	fn=$1
 	if [ "$ALL" -eq 0 ]; then
 		"$fn" "$MID" "$LABEL"
@@ -196,33 +239,332 @@ each_machine() { # each_machine <fn> -- run fn on the selected machine(s)
 		log "这把 key 名下没有机器"
 		return 1
 	fi
-	bad=0
+	fail=${TMPDIR:-/tmp}/instabox-keepalive-fail.$$
+	: > "$fail"
 	printf '%s\n' "$list" | while IFS='	' read -r id name; do
 		[ -n "$id" ] || continue
-		"$fn" "$id" "${name:-$id}" || bad=$((bad + 1))
+		"$fn" "$id" "${name:-$id}" || echo x >> "$fail"
 	done
+	bad=$(wc -l < "$fail" | tr -d ' ')
+	rm -f "$fail"
+	if [ "$bad" != "0" ]; then
+		log "$bad/$count 台失败"
+		return 1
+	fi
 	return 0
 }
 
-renew()   { preflight && each_machine renew_one; }
+renew() { preflight && each_machine renew_one; }
 release() { preflight && each_machine release_one; }
-status()  { preflight && each_machine status_one; }
+status() { preflight && each_machine status_one; }
 
-CMD=${1:-}
-[ -n "$CMD" ] || CMD=--watch
-case "$CMD" in
-	--once)    renew ;;
-	--release) release ;;
-	--status)  status ;;
-	--watch|-w)
-		preflight
-		if [ "$ALL" -eq 1 ]; then TARGET="全部机器（按 key 自动发现）"; else TARGET=$LABEL; fi
-		log "watch: 每 ${RENEW}s 续租 $TARGET/$LEASE（ttl ${TTL}s），API $API"
-		while :; do
-			renew || log "这一轮有失败，下一轮再试"
-			sleep "$RENEW"
-		done
+run_once() { # 一次续租（cron / 冒烟测试用）
+	load_env "$SELF_DIR"
+	reload_runtime
+	renew
+}
+
+run_watch() { # 常驻（systemd / OpenRC 用）
+	load_env "$SELF_DIR"
+	reload_runtime
+	preflight
+	if [ "$ALL" -eq 1 ]; then TARGET="全部机器（按 key 自动发现）"; else TARGET=$LABEL; fi
+	log "watch: 每 ${RENEW}s 续租 $TARGET/$LEASE（ttl ${TTL}s），API $API"
+	while :; do
+		renew || log "这一轮有失败，下一轮再试"
+		sleep "$RENEW"
+	done
+}
+
+# ---- 安装 --------------------------------------------------------------------
+do_install() {
+	if [ "$(id -u)" -ne 0 ]; then
+		if command -v sudo >/dev/null 2>&1 && [ -f "$0" ]; then
+			log "需要 root，sudo 重跑一次"
+			exec sudo -E sh "$0" install "$@"
+		fi
+		die "需要 root。非 root 机器： curl -Ls $RAW/keepalive.sh | sudo -E env key=你的KEY sh"
+	fi
+
+	while [ "$#" -gt 0 ]; do
+		a=$1
+		shift
+		case "$a" in
+			key=*|KEY=*|INSTABOX_API_KEY=*) API_KEY=${a#*=} ;;
+			machine=*|INSTABOX_MACHINE=*) NAME=${a#*=} ;;
+			--lease=*) LEASE=${a#*=} ;;
+			--lease) LEASE=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			--ttl=*) TTL=${a#*=} ;;
+			--ttl) TTL=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			--dir=*) DIR=${a#*=} ;;
+			--dir) DIR=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			--service=*) SERVICE=${a#*=} ;;
+			--service) SERVICE=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			--raw=*) RAW=${a#*=} ;;
+			--raw) RAW=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			--api=*) API=${a#*=} ;;
+			--api) API=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			--no-start) WANT_START=0 ;;
+			--cron) FORCE_CRON=1 ;;
+			install) : ;;
+			-h|--help) usage; exit 0 ;;
+			*) die "未知安装参数: $a（看 --help）" ;;
+		esac
+	done
+
+	# 没显式给 key 就沿用这台机器上已经装好的那份配置（重装/升级不会弄丢 key）
+	if [ -z "$API_KEY" ] && [ -f "$DIR/.env" ]; then
+		API_KEY=$(sed -n 's/^INSTABOX_API_KEY=//p' "$DIR/.env" | head -n 1)
+		[ -n "$NAME" ] || NAME=$(sed -n 's/^INSTABOX_MACHINE=//p' "$DIR/.env" | head -n 1)
+	fi
+	[ -n "$API_KEY" ] || die "缺 key。用法： key=你的KEY bash <(curl -Ls $RAW/keepalive.sh)"
+
+	case "$TTL" in ''|*[!0-9]*) die "TTL 必须是数字: $TTL" ;; esac
+	if [ "$TTL" -lt 30 ] || [ "$TTL" -gt 3600 ]; then die "TTL 必须在 30-3600 秒之间"; fi
+
+	log "安装参数：key=$(mask "$API_KEY") machine=${NAME:-全部} lease=$LEASE ttl=${TTL}s dir=$DIR"
+
+	if ! command -v curl >/dev/null 2>&1; then
+		log "装 curl"
+		if command -v apk >/dev/null 2>&1; then apk add --no-cache curl
+		elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq curl
+		elif command -v dnf >/dev/null 2>&1; then dnf install -y -q curl
+		elif command -v yum >/dev/null 2>&1; then yum install -y -q curl
+		elif command -v opkg >/dev/null 2>&1; then opkg update && opkg install curl
+		fi
+	fi
+	command -v curl >/dev/null 2>&1 || die "curl 装不上，请手动装好再跑"
+
+	mkdir -p "$DIR" || die "建不了目录 $DIR"
+
+	# 只有 $0 不是这份文件的真身时才需要搬；搬用 rename，避免正在跑的自己被写坏
+	if [ "$SELF_DIR" = "$DIR" ] && [ -f "$DIR/keepalive.sh" ]; then
+		say "脚本已在 $DIR/keepalive.sh，跳过复制"
+	else
+		tmp=$DIR/.keepalive.sh.new
+		if [ -f "$0" ] && [ -r "$0" ] && [ "$SELF_DIR" != "/dev/fd" ]; then
+			cp -f "$0" "$tmp" || die "复制脚本失败"
+		else
+			curl -fsSL -m 60 -o "$tmp" "$RAW/keepalive.sh" || die "下载 $RAW/keepalive.sh 失败"
+		fi
+		chmod 755 "$tmp"
+		mv -f "$tmp" "$DIR/keepalive.sh" || die "落地 $DIR/keepalive.sh 失败"
+		say "脚本已落地 $DIR/keepalive.sh"
+	fi
+
+	umask 077
+	{
+		printf 'INSTABOX_API_KEY=%s\n' "$API_KEY"
+		printf 'INSTABOX_MACHINE=%s\n' "$NAME"
+		printf 'INSTABOX_LEASE=%s\n' "$LEASE"
+		printf 'INSTABOX_LEASE_TTL=%s\n' "$TTL"
+	} > "$DIR/.env" || die "写 $DIR/.env 失败"
+	chmod 600 "$DIR/.env"
+	printf '%s\n' '.env' 'install.conf' > "$DIR/.gitignore"
+	{
+		printf 'INSTABOX_SERVICE=%s\n' "$SERVICE"
+		printf 'INSTABOX_DIR=%s\n' "$DIR"
+		printf 'INSTABOX_RAW=%s\n' "$RAW"
+	} > "$DIR/install.conf"
+	say "$DIR/.env 已写（权限 600，key 只在这里）"
+
+	log "冒烟测试：先手动续租一次"
+	if ! INSTABOX_ENV_FILE=$DIR/.env sh "$DIR/keepalive.sh" --once; then
+		die "续租测试没过，先解决上面的报错再装服务（key、machine 名字最容易错）"
+	fi
+	say "续租成功"
+
+	interval_min=$((TTL * 3 / 5 / 60))
+	[ "$interval_min" -lt 1 ] && interval_min=1
+	suite=
+	if [ "$FORCE_CRON" -eq 0 ]; then
+		if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+			suite=systemd
+		elif command -v rc-update >/dev/null 2>&1 && [ -x /sbin/openrc-run ]; then
+			suite=openrc
+		fi
+	fi
+	[ -n "$suite" ] || suite=cron
+
+	case "$suite" in
+		systemd)
+			cat > "/etc/systemd/system/$SERVICE.service" <<EOF_UNIT
+[Unit]
+Description=InstaBox keepalive (activity lease renewer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$DIR
+Environment=INSTABOX_ENV_FILE=$DIR/.env
+ExecStart=/bin/sh $DIR/keepalive.sh --watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+			systemctl daemon-reload
+			[ "$WANT_START" -eq 1 ] && systemctl enable --now "$SERVICE.service" >/dev/null 2>&1
+			say "systemd 服务 $SERVICE 已装（日志： journalctl -u $SERVICE -f）"
+			;;
+		openrc)
+			cat > "/etc/init.d/$SERVICE" <<EOF_INIT
+#!/sbin/openrc-run
+name="instabox keepalive"
+command="/bin/sh"
+command_args="$DIR/keepalive.sh --watch"
+command_background=true
+pidfile="/run/$SERVICE.pid"
+output_log="/var/log/$SERVICE.log"
+error_log="/var/log/$SERVICE.log"
+export INSTABOX_ENV_FILE="$DIR/.env"
+EOF_INIT
+			chmod 755 "/etc/init.d/$SERVICE"
+			rc-update add "$SERVICE" default >/dev/null 2>&1
+			[ "$WANT_START" -eq 1 ] && rc-service "$SERVICE" start >/dev/null 2>&1
+			say "OpenRC 服务 $SERVICE 已装（日志： /var/log/$SERVICE.log）"
+			;;
+		cron)
+			case "$interval_min" in
+				1) schedule='* * * * *' ;;
+				*) schedule="*/$interval_min * * * *" ;;
+			esac
+			line="$schedule INSTABOX_ENV_FILE=$DIR/.env /bin/sh $DIR/keepalive.sh --once >/dev/null 2>&1"
+			( crontab -l 2>/dev/null | grep -vF "$DIR/keepalive.sh"; printf '%s\n' "$line" ) | crontab - || die "写 crontab 失败"
+			say "cron 已装：$schedule（每 $interval_min 分钟一次）"
+			;;
+	esac
+
+	echo
+	if [ "$WANT_START" -eq 1 ]; then
+		log "装好了。机器 ${NAME:-全部（按 key 自动发现）} 会被持续续租，就不会空闲挂起。"
+	else
+		log "装好了（--no-start，没启动）。启动： systemctl enable --now $SERVICE  或  rc-service $SERVICE start"
+	fi
+	say "看状态： sh $DIR/keepalive.sh --status"
+	say "卸载：   sh $DIR/keepalive.sh uninstall"
+	say "手动续租一次： sh $DIR/keepalive.sh --once"
+}
+
+# ---- 卸载 --------------------------------------------------------------------
+do_uninstall() {
+	KEEP_FILES=0
+	KEEP_LEASE=0
+	DIR_GIVEN=0
+	# 直接在安装目录里跑这份脚本（最常见）：落点就是它自己，别猜
+	if [ -f "$SELF_DIR/install.conf" ]; then DIR=$SELF_DIR; fi
+	while [ "$#" -gt 0 ]; do
+		a=$1
+		shift
+		case "$a" in
+			--keep-files) KEEP_FILES=1 ;;
+			--keep-lease) KEEP_LEASE=1 ;;
+			-h|--help) usage; exit 0 ;;
+			--dir=*) DIR=${a#*=}; DIR_GIVEN=1 ;;
+			--dir) DIR=${1:-}; DIR_GIVEN=1; [ "$#" -gt 0 ] && shift ;;
+			--service=*) SERVICE=${a#*=} ;;
+			--service) SERVICE=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			*) die "未知参数: $a（看 --help）" ;;
+		esac
+	done
+	[ "$(id -u)" -eq 0 ] || die "需要 root（curl -Ls $RAW/keepalive.sh | sudo -E sh -s uninstall）"
+
+	# 装的时候把落点写进 install.conf，这里照它找人，不靠猜。从 /dev/fd 跑（curl | sh）
+	# 或者别人把脚本拷到别处跑，就退回默认目录。
+	if [ "$DIR_GIVEN" -eq 0 ] && [ ! -f "$DIR/install.conf" ] && [ -f "$DEF_DIR/install.conf" ]; then DIR=$DEF_DIR; fi
+	if [ -f "$DIR/install.conf" ]; then
+		v=$(sed -n 's/^INSTABOX_SERVICE=//p' "$DIR/install.conf" | head -n 1)
+		[ -n "$v" ] && SERVICE=$v
+		v=$(sed -n 's/^INSTABOX_RAW=//p' "$DIR/install.conf" | head -n 1)
+		[ -n "$v" ] && RAW=$v
+	fi
+
+	# 1) 监督者。unit 只有确实指向这个目录才删——卸载绝不能顺手带走同名的别人的服务。
+	UNIT=/etc/systemd/system/$SERVICE.service
+	if [ -f "$UNIT" ]; then
+		if grep -qF "$DIR/keepalive.sh" "$UNIT"; then
+			systemctl disable --now "$SERVICE.service" >/dev/null 2>&1 || true
+			rm -f "$UNIT"
+			systemctl daemon-reload >/dev/null 2>&1 || true
+			say "已停止并删除 systemd 服务 $SERVICE"
+		else
+			say "跳过 systemd 服务 $SERVICE：它不指向 $DIR"
+		fi
+	fi
+	INIT=/etc/init.d/$SERVICE
+	if [ -f "$INIT" ]; then
+		if grep -qF "$DIR/keepalive.sh" "$INIT"; then
+			rc-service "$SERVICE" stop >/dev/null 2>&1 || true
+			rc-update del "$SERVICE" default >/dev/null 2>&1 || true
+			rm -f "$INIT"
+			say "已停止并删除 OpenRC 服务 $SERVICE"
+		else
+			say "跳过 OpenRC 服务 $SERVICE：它不指向 $DIR"
+		fi
+	fi
+	if command -v crontab >/dev/null 2>&1; then
+		BEFORE=$(crontab -l 2>/dev/null || true)
+		AFTER=$(printf '%s\n' "$BEFORE" | grep -vF "$DIR/keepalive.sh" | grep -v '^$' || true)
+		if [ "$AFTER" != "$BEFORE" ]; then
+			printf '%s\n' "$AFTER" | crontab - 2>/dev/null || true
+			say "已删掉 cron 条目"
+		fi
+	fi
+
+	# 2) 租约：主动放掉，机器立刻恢复“空闲 30 分钟自动挂起”的正常行为
+	if [ "$KEEP_LEASE" -eq 0 ] && [ -f "$DIR/keepalive.sh" ] && [ -f "$DIR/.env" ]; then
+		INSTABOX_ENV_FILE=$DIR/.env sh "$DIR/keepalive.sh" --release || true
+	fi
+
+	# 3) 文件
+	if [ "$KEEP_FILES" -eq 0 ]; then
+		rm -rf "$DIR"
+		say "已删除 $DIR"
+	else
+		say "保留 $DIR（--keep-files）"
+	fi
+	log "卸载完了。"
+}
+
+usage() {
+	sed -n '2,/^set -u$/p' "$0" | sed -e 's/^# \?//' -e '$d'
+}
+
+case "${1:-}" in
+	install)
+		shift
+		do_install "$@"
 		;;
-	-h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
-	*)         echo "用法: $0 [--watch|--once|--status|--release|--help]" >&2; exit 2 ;;
+	uninstall|--uninstall|-U)
+		shift
+		do_uninstall "$@"
+		;;
+	--watch|-w) run_watch ;;
+	--once|-1) run_once ;;
+	--status|-s)
+		load_env "$SELF_DIR"
+		reload_runtime
+		status
+		;;
+	--release|-r)
+		load_env "$SELF_DIR"
+		reload_runtime
+		release
+		;;
+	-h|--help|help) usage ;;
+	key=*|KEY=*|machine=*|INSTABOX_*=*|--lease*|--ttl*|--dir*|--service*|--raw*|--api*|--no-start|--cron)
+		do_install "$@"
+		;;
+	'')
+		# 不带参数 = 安装（`key=… bash <(curl …/keepalive.sh)` 的用法）
+		# 已经装过的机器上再跑一次 = 按现有 .env 重装/升级
+		do_install
+		;;
+	*)
+		printf '未知参数: %s\n\n' "$1" >&2
+		usage >&2
+		exit 2
+		;;
 esac

@@ -6,13 +6,15 @@
 
 ```sh
 # 保活名下全部机器（有几台保几台，机器名都不用填）
-key=ibk_xxxxxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/install.sh)
+key=ibk_xxxxxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
 
 # 只保活某一台： machine= 后面写你自己的机器名（下面「机器名从哪来」）
-key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/install.sh)
+key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
 
 # 非 root： curl -Ls <同一个地址> | sudo -E env key=ibk_xxxxxx machine=qqq sh
 ```
+
+就一个文件 `keepalive.sh`：不带参数＝安装/更新，`uninstall`＝卸载，`--once` / `--watch` / `--status` / `--release`＝手动用。`sh keepalive.sh --help` 看全部参数。
 
 装完会立刻做一次续租自检，失败就不装。服务形式按系统自动挑：**systemd → OpenRC → cron**。
 
@@ -37,7 +39,7 @@ key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pin
 | `INSTABOX_RENEW_EVERY` | `0.6 × ttl` | 续租间隔 |
 | `INSTABOX_API_URL` | `https://api.instabox.sh` | 换私有网关时才用 |
 
-安装参数：`--lease` `--ttl` `--dir`（默认 `/root/instabox-keepalive`）`--service`（默认 `instabox-keepalive`）`--cron`（强制用 cron）`--no-start` `--uninstall`。
+安装参数（跟在不带参数的安装命令后面，或写成 `key=` 那种环境变量）：`--lease` `--ttl` `--dir`（默认 `/root/instabox-keepalive`）`--service`（默认 `instabox-keepalive`）`--raw`（自更新用的 raw 前缀）`--cron`（强制用 cron）`--no-start`。也接受 `install` 这个写法：`sh keepalive.sh install key=ibk_xxx`。
 
 ## 日常
 
@@ -45,7 +47,12 @@ key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pin
 sh /root/instabox-keepalive/keepalive.sh --status    # 机器状态 + 自动休眠设置（不填机器=全部）
 sh /root/instabox-keepalive/keepalive.sh --once      # 手动续一次
 sh /root/instabox-keepalive/keepalive.sh --release   # 放掉租约，恢复空闲休眠
-sh /root/instabox-keepalive/uninstall.sh             # 彻底卸载（停服务、删 unit、放租约、删目录）
+sh /root/instabox-keepalive/keepalive.sh             # 想升级：直接再跑一次安装命令即可
+
+# 彻底卸载（停服务、删 unit、清 cron 条目、放租约、删目录）
+sh /root/instabox-keepalive/keepalive.sh uninstall
+
+# 卸载可加： --keep-files 只停服务保留目录与 .env； --keep-lease 不动租约
 ```
 
 一次 `--once` 的输出长这样（两台机器）：
