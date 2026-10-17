@@ -30,6 +30,7 @@
 #   运行期变量（.env 或环境变量；环境变量优先）
 #     INSTABOX_ENV_FILE      .env 路径（默认脚本同目录）
 #     INSTABOX_RENEW_EVERY   两次续租的间隔秒数（默认租约的 3/5）
+#     INSTABOX_AUTO_RESUME   1（默认）：机器被挂起/停掉时先 resume（stopped 用 start 兜底）再续租；0=只报错不唤醒
 #     INSTABOX_API_URL       API 地址（默认 https://api.instabox.sh）
 #
 # 机器被挂起后机器内部的定时器也会冻结，所以续租必须从机器外面打进来。
@@ -78,6 +79,7 @@ reload_runtime() { # .env / 环境变量里的值最终生效一次
 	LEASE=${INSTABOX_LEASE:-$LEASE}
 	TTL=${INSTABOX_LEASE_TTL:-$TTL}
 	RENEW=${INSTABOX_RENEW_EVERY:-$((TTL * 3 / 5))}
+	AUTO_RESUME=${INSTABOX_AUTO_RESUME:-1}
 	ALL=0
 	case "$MACHINE" in ""|all|ALL|All|'*') ALL=1 ;; esac
 	return 0
@@ -92,7 +94,9 @@ jget() {
 	printf '%s' "$1" | awk -v k="$2" '
 		match($0, "\"" k "\":[^,}]*") {
 			v = substr($0, RSTART + length(k) + 3, RLENGTH - length(k) - 3)
+			gsub(/^[ 	]+|[ 	]+$/, "", v)
 			gsub(/^"|"$/, "", v)
+			gsub(/^[ 	]+|[ 	]+$/, "", v)
 			print v
 			exit
 		}'
@@ -190,13 +194,52 @@ preflight() {
 	resolve || exit 1
 }
 
-renew_one() { # renew_one <id> <label>
-	if ! http PUT "/v1/machines/$1/activity-leases/$LEASE" "{\"ttlSeconds\":$TTL}"; then
-		log "续租失败 $2/$LEASE HTTP $HTTP_CODE: $HTTP_BODY"
-		return 1
+# 机器被平台挂起（suspended）或停掉了：续租一律 409 machine_not_running，光续租是空转，
+# 得先唤醒。wake_action 用带 Idempotency-Key 的 POST（换状态的接口缺这个头会 400）。
+is_not_running() {
+	[ "$HTTP_CODE" = "409" ] || return 1
+	printf '%s' "$HTTP_BODY" | grep -Eqi 'not_running|suspended|stopped'
+}
+
+wake_action() { # wake_action <id> <resume|start> -> 打印 HTTP 码
+	wc=$(curl -sS -m 30 -X POST "$API/v1/machines/$1/$2" \
+		-H "X-API-Key: $KEY" -H "Idempotency-Key: ka-$2-$1-$$-$(date +%s)" \
+		-o /dev/null -w '%{http_code}' 2>/dev/null) || wc=0
+	printf '%s' "$wc"
+}
+
+wake_one() { # wake_one <id> <label>；0=已经 running
+	c1=$(wake_action "$1" resume)
+	if [ "$c1" = "202" ] || [ "$c1" = "200" ]; then
+		log "唤醒 $2: resume HTTP $c1"
+	else
+		c2=$(wake_action "$1" start)
+		log "唤醒 $2: resume HTTP $c1 → start HTTP $c2"
 	fi
-	log "续租 ok $2/$LEASE 到期 $(jget "$HTTP_BODY" expiresAt)"
-	return 0
+	i=0
+	while [ "$i" -lt "${INSTABOX_WAKE_TRIES:-3}" ]; do
+		sleep "${INSTABOX_WAKE_GAP:-5}"
+		if http GET "/v1/machines/$1" && [ "$(jget "$HTTP_BODY" state)" = "running" ]; then
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+renew_one() { # renew_one <id> <label>
+	if http PUT "/v1/machines/$1/activity-leases/$LEASE" "{\"ttlSeconds\":$TTL}"; then
+		log "续租 ok $2/$LEASE 到期 $(jget "$HTTP_BODY" expiresAt)"
+		return 0
+	fi
+	if [ "$AUTO_RESUME" = "1" ] && is_not_running; then
+		if wake_one "$1" "$2" && http PUT "/v1/machines/$1/activity-leases/$LEASE" "{\"ttlSeconds\":$TTL}"; then
+			log "续租 ok（唤醒后）$2/$LEASE 到期 $(jget "$HTTP_BODY" expiresAt)"
+			return 0
+		fi
+	fi
+	log "续租失败 $2/$LEASE HTTP $HTTP_CODE: $HTTP_BODY"
+	return 1
 }
 
 release_one() { # release_one <id> <label>

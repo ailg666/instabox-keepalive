@@ -37,6 +37,8 @@ key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pin
 | `INSTABOX_LEASE` | `keepalive` | 租约名，同名就是续同一个租约 |
 | `INSTABOX_LEASE_TTL` | `300` | 秒，30–3600；留得越短越安全，但续租要跟得上 |
 | `INSTABOX_RENEW_EVERY` | `0.6 × ttl` | 续租间隔 |
+| `INSTABOX_AUTO_RESUME` | `1` | 续租碰到 `409 machine_not_running`（机器被挂起/停掉）就先 `resume`（`stopped` 用 `start` 兜底）等它 `running` 再续；设 `0` 只报错不唤醒 |
+| `INSTABOX_WAKE_GAP` / `INSTABOX_WAKE_TRIES` | `5` / `3` | 唤醒后每次探测的间隔秒数 / 最多探测几次 |
 | `INSTABOX_API_URL` | `https://api.instabox.sh` | 换私有网关时才用 |
 
 安装参数（跟在不带参数的安装命令后面，或写成 `key=` 那种环境变量）：`--lease` `--ttl` `--dir`（默认 `/root/instabox-keepalive`）`--service`（默认 `instabox-keepalive`）`--raw`（自更新用的 raw 前缀）`--cron`（强制用 cron）`--no-start`。也接受 `install` 这个写法：`sh keepalive.sh install key=ibk_xxx`。
@@ -64,7 +66,7 @@ sh /root/instabox-keepalive/keepalive.sh uninstall
 
 ## Cloudflare Worker 方案
 
-不想为这件事常开一台机器，可以把续租放到 Worker 上（`worker/` 目录，cron 每 4 分钟跑一次，和你自己的机器无关）。
+不想为这件事常开一台机器，可以把续租放到 Worker 上（`worker/` 目录，cron 每 9 分钟跑一次，和你自己的机器无关）。
 
 **网页面板部署（推荐，不用装 wrangler）**
 
@@ -77,13 +79,18 @@ sh /root/instabox-keepalive/keepalive.sh uninstall
    | `INSTABOX_API_KEY` | **Secret（加密）** | 你的 `ibk_...` |
    | `TOKEN` | Secret（自己起一串随机值） | 之后所有请求都要带 `?token=` |
    | `INSTABOX_MACHINE` | Text | 留空 = 保活全部机器；填 `qqq` 只保一台 |
-   | `INSTABOX_LEASE_TTL` | Text | `300`（可选） |
+   | `INSTABOX_LEASE_TTL` | Text | `900`（可选） |
    | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
+   | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先 `resume`（stopped 用 `start` 兜底）再续租；设 `0` 只报错不唤醒 |
 
    > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
    > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 9 分钟就填 `900`，填 `300` 会在两次续租之间出现空窗。
-4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/4 * * * *`（每 4 分钟）→ 保存。这就是自动保活的开关
+4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/9 * * * *`（每 9 分钟）→ 保存。这就是自动保活的开关
 5. 想看 `/log`：`Storage & Databases` → `KV` → `Create namespace`，然后在 Worker 的 `Settings` → `Bindings` 里加一个 KV 绑定，**变量名填 `LOG`**、选刚建的空间。不绑也能用，只是 `/log` 是空的
+
+**机器被挂起/停掉会怎样**
+
+续租对 `suspended` / `stopped` 的机器一律回 `409 machine_not_running`——光续租是空转，机器不会自己醒。默认 `INSTABOX_AUTO_RESUME=1`：碰到这个错就先 `POST /resume`（`stopped` 的用 `/start` 兜底），等它变成 `running` 再立刻续租；日志里这条会带 `"resumed":true` 和 `"wake":["resume:202"]`。设成 `0` 就只报错、不唤醒。
 
 **KV 额度够不够**
 

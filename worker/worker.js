@@ -15,6 +15,10 @@
 //   hourly（默认）同一小时的连续成功只写 1 条 ≈24 次/天，失败立刻记
 //   every  每次续租都写（*/9 = 160 次/天，仍在额度内）
 //   off    完全不写 KV，/log 会是空的
+//
+// 机器被平台挂起（suspended）或停掉时，续租会 409 machine_not_running —— 此时光续租没用，
+// 得先唤醒：自动 POST /resume（stopped 的用 /start 兜底）→ 等 running → 再续租。
+// INSTABOX_AUTO_RESUME=0 可以关掉这个自愈。
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 300;
@@ -28,6 +32,8 @@ function cfg(env) {
     lease: env.INSTABOX_LEASE || LEASE_DEFAULT,
     ttl: Number.isFinite(ttl) && ttl >= 30 && ttl <= 3600 ? ttl : TTL_DEFAULT,
     kv: env.LOG || null,
+    // 被平台挂起后光续租没用，默认自愈：409 machine_not_running → resume/start → 再续租
+    autoResume: (env.INSTABOX_AUTO_RESUME ?? "1") !== "0",
     // hourly（默认）：同一小时的“成功”不重复写 KV，省额度；every：每次都写；off：不写
     logMode: (env.INSTABOX_LOG_MODE || "hourly").trim(),
   };
@@ -58,13 +64,13 @@ async function machines(c) {
   if (cache.key === c.machine && now - cache.at < 600_000) return cache.list;
   let list = [];
   if (c.machine.startsWith("m_")) {
-    list = [{ id: c.machine, name: c.machine }];
+    list = [{ id: c.machine, name: c.machine, state: "" }];
   } else if (c.machine) {
     const r = await call(c, "GET", `/v1/machines/${c.machine}`);
-    if (r.ok && r.json?.id) list = [{ id: r.json.id, name: r.json.name || c.machine }];
+    if (r.ok && r.json?.id) list = [{ id: r.json.id, name: r.json.name || c.machine, state: r.json.state || "" }];
   } else {
     const r = await call(c, "GET", "/v1/machines");
-    if (r.ok) list = (r.json?.machines || []).map((m) => ({ id: m.id, name: m.name }));
+    if (r.ok) list = (r.json?.machines || []).map((m) => ({ id: m.id, name: m.name, state: m.state || "" }));
   }
   cache = { key: c.machine, list, at: now };
   return list;
@@ -89,6 +95,50 @@ async function logEvent(c, entry, force) {
   }
 }
 
+const lease = (c, id) =>
+  call(c, "PUT", `/v1/machines/${id}/activity-leases/${c.lease}`, { ttlSeconds: c.ttl });
+
+// 409 machine_not_running：机器被平台挂起（suspended）或停掉了，续租对它是无效的
+const isNotRunning = (r) =>
+  r.status === 409 && /not_running|suspended|stopped/i.test(r.text || "");
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+// 换状态的写操作要 Idempotency-Key（缺了 400）；key 带时间戳，重试不会撞旧 key
+async function act(c, id, type) {
+  const res = await fetch(`${c.api}/v1/machines/${id}/${type}`, {
+    method: "POST",
+    headers: { "X-API-Key": c.key, "Idempotency-Key": `ka-${type}-${id}-${Date.now()}` },
+  });
+  const text = await res.text();
+  return { ok: res.ok, status: res.status, text };
+}
+
+async function stateOf(c, id) {
+  const r = await call(c, "GET", `/v1/machines/${id}`);
+  return r.ok ? r.json?.state || "" : "";
+}
+
+// 挂了就先唤醒再续租：resume 优先，stopped 的用 start 兜底；running 后立刻续租一次
+async function wakeThenLease(c, m) {
+  const wake = [];
+  for (const type of ["resume", "start"]) {
+    const a = await act(c, m.id, type);
+    wake.push(`${type}:${a.status}`);
+    if (a.ok) break;
+  }
+  for (let i = 0; i < 3; i++) {
+    await sleep(5000);
+    if ((await stateOf(c, m.id)) === "running") {
+      const r = await lease(c, m.id);
+      return r.ok
+        ? { ok: true, resumed: true, expiresAt: r.json?.expiresAt, wake }
+        : { ok: false, resumed: true, status: r.status, error: r.text.slice(0, 200), wake };
+    }
+  }
+  return { ok: false, resumed: true, status: 409, error: "已发唤醒，机器还没 running（下一轮再续）", wake };
+}
+
 async function keepalive(c, forceLog) {
   if (!c.key) return { ok: false, error: "缺 INSTABOX_API_KEY" };
   const list = await machines(c);
@@ -100,14 +150,16 @@ async function keepalive(c, forceLog) {
   }
   const results = [];
   for (const m of list) {
-    const r = await call(c, "PUT", `/v1/machines/${m.id}/activity-leases/${c.lease}`, {
-      ttlSeconds: c.ttl,
-    });
-    results.push(
-      r.ok
-        ? { machine: m.name, id: m.id, ok: true, expiresAt: r.json?.expiresAt }
-        : { machine: m.name, id: m.id, ok: false, status: r.status, error: r.text.slice(0, 200) },
-    );
+    const r = await lease(c, m.id);
+    const base = { machine: m.name, id: m.id };
+    if (r.ok) {
+      results.push({ ...base, ok: true, expiresAt: r.json?.expiresAt });
+    } else if (c.autoResume && isNotRunning(r)) {
+      // 被挂起了：续租是空转，先把它弄醒再续
+      results.push({ ...base, ...(await wakeThenLease(c, m)) });
+    } else {
+      results.push({ ...base, ok: false, status: r.status, error: r.text.slice(0, 200) });
+    }
   }
   const out = {
     ok: results.every((r) => r.ok),
