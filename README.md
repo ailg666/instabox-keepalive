@@ -7,7 +7,7 @@
 直接把机器自带的空闲自动挂起**永久关掉**（`autoSuspendAfterSeconds=0` → 服务端记为 `null`＝永不自动挂起）。一条命令，不用克隆也不装任何东西：
 
 ```sh
-key=ibk_xxxxxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/disable-sleep-mechanism.sh)
+APIKEY=*** bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/disable-sleep-mechanism.sh)
 ```
 
 - 用你的 key 列出名下全部机器，逐台把自动挂起设为关闭；幂等，已关闭的跳过，可安全重跑。
