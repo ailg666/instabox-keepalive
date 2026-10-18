@@ -4,18 +4,15 @@
 
 ## 首选：disable-sleep-mechanism.sh（一次性关掉休眠机制，跑一次就够了）
 
-直接把机器自带的空闲自动挂起**永久关掉**（`autoSuspendAfterSeconds=0` → 服务端记为 `null`＝永不自动挂起）：
+直接把机器自带的空闲自动挂起**永久关掉**（`autoSuspendAfterSeconds=0` → 服务端记为 `null`＝永不自动挂起）。一条命令，不用克隆也不装任何东西：
 
 ```sh
-git clone https://github.com/pingmike2/instabox-keepalive
-cd instabox-keepalive
-INSTABOX_API_KEY=<你的key> ./disable-sleep-mechanism.sh    # 单次执行
+key=ibk_xxxxxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/disable-sleep-mechanism.sh)
 ```
 
 - 用你的 key 列出名下全部机器，逐台把自动挂起设为关闭；幂等，已关闭的跳过，可安全重跑。
-- **一次性**执行，不装服务、不留后台，跑一次就不用管了。
-- 参数：`--key ibk_xxx` 命令行传 key；`--dry-run` 只预览会改哪些，不真改。
-- key 只从环境变量 / `--key` / 本地 `.key` 读，`.key` 已在 `.gitignore`，仓库里不含任何凭证。
+- **一次性**执行，跑一次就不用管了；重复跑也只是确认一遍。
+- 想预览不真改：`... disable-sleep-mechanism.sh --dry-run`
 
 ## 备用：keepalive.sh 续租保活
 

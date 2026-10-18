@@ -6,8 +6,8 @@
 #       幂等：已关闭的机器自动跳过，可安全重跑。
 #
 # 用法：
-#   INSTABOX_API_KEY=<你的key> ./disable-sleep-mechanism.sh    # 单次执行
-#   ./disable-sleep-mechanism.sh --key ibk_xxx                 # 或命令行传 key
+#   key=ibk_xxxxxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/disable-sleep-mechanism.sh)
+#   INSTABOX_API_KEY=<你的key> ./disable-sleep-mechanism.sh    # 或本地跑
 #   ./disable-sleep-mechanism.sh --dry-run                     # 只列出会改哪些，不真改
 #
 # key 只从环境变量 / 命令行 / 本地 .key 文件读，永不打进仓库。
@@ -25,13 +25,15 @@ while [[ $# -gt 0 ]]; do
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
+# 兼容 keepalive.sh 的写法：key= / INSTABOX_API_KEY= 都认
+if [[ -z "$KEY" ]]; then KEY="${key:-}"; fi
 if [[ -z "$KEY" ]]; then KEY="${INSTABOX_API_KEY:-}"; fi
 if [[ -z "$KEY" && -f "$(dirname "$0")/.key" ]]; then
   KEY="$(tr -d '[:space:]' < "$(dirname "$0")/.key")"
 fi
 if [[ -z "$KEY" ]]; then
   echo "错误：未提供 API key" >&2
-  echo "  INSTABOX_API_KEY=*** $0  或  $0 --key ibk_xxx" >&2
+  echo "  key=ibk_xxx bash <(curl -Ls <raw 地址>/disable-sleep-mechanism.sh)  或  ./disable-sleep-mechanism.sh --key ibk_xxx" >&2
   exit 1
 fi
 
