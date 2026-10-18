@@ -20,6 +20,20 @@ key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pin
 
 装完会立刻做一次续租自检，失败就不装。服务形式按系统自动挑：**systemd → OpenRC → cron**。
 
+## 关于 `disable-sleep-mechanism.sh`（可能无效，慎用）
+
+仓库里也留了一个一次性脚本 `disable-sleep-mechanism.sh`，思路是直接把每台机器的 `autoSuspendAfterSeconds` 改成 0。**在多数账号上它不会生效**：只要 `/v1/me` 里的 `fixedAutoSuspendSeconds` 不是 0（免费/邀请制账号常见 1800），服务端就会把对机器字段的修改**静默丢弃**，返回 200 但值不变 —— 连官方 `instabox auto-suspend <box> 0` 也一样无效。
+
+脚本自己会判断，不会假报成功：
+
+```sh
+APIKEY=*** bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/disable-sleep-mechanism.sh)
+# ！账号空闲阈值被服务端锁死: fixedAutoSuspendSeconds=1800（/v1/me，只读）
+#   [无效] m_xxx (qqq) 服务端未接受，仍为 1800
+```
+
+**结论：默认用上面的 `keepalive.sh` 续租**，那是唯一稳定有效的办法；`disable-sleep-mechanism.sh` 只在 `fixedAutoSuspendSeconds=0` 的账号（可自由改空闲策略）上才有意义。
+
 ## 机器名从哪来
 
 `machine=qqq` 里的 `qqq` 只是示例，**换成你自己的机器名**。名字由你创建机器时指定（`instabox ls` 或网页面板都能看到），不用记也没关系：
