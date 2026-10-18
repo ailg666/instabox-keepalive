@@ -6,9 +6,9 @@
 #       幂等：已关闭的机器自动跳过，可安全重跑。
 #
 # 用法：
-#   INSTABOX_API_KEY=<你的key> ./一键解除休眠机制.sh    # 单次执行
-#   ./一键解除休眠机制.sh --key ibk_xxx                 # 或命令行传 key
-#   ./一键解除休眠机制.sh --dry-run                     # 只列出会改哪些，不真改
+#   INSTABOX_API_KEY=<你的key> ./disable-sleep-mechanism.sh    # 单次执行
+#   ./disable-sleep-mechanism.sh --key ibk_xxx                 # 或命令行传 key
+#   ./disable-sleep-mechanism.sh --dry-run                     # 只列出会改哪些，不真改
 #
 # key 只从环境变量 / 命令行 / 本地 .key 文件读，永不打进仓库。
 set -euo pipefail

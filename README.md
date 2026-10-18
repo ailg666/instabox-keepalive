@@ -1,6 +1,25 @@
 # instabox-keepalive
 
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。这个脚本用官方的 **activity lease** 定期续租，让它一直醒着；不需要在机器里装任何东西。
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库提供两种办法阻止它休眠：**首选——一次性关掉休眠机制；备用——activity lease 定期续租保活**。
+
+## 首选：disable-sleep-mechanism.sh（一次性关掉休眠机制，跑一次就够了）
+
+直接把机器自带的空闲自动挂起**永久关掉**（`autoSuspendAfterSeconds=0` → 服务端记为 `null`＝永不自动挂起）：
+
+```sh
+git clone https://github.com/pingmike2/instabox-keepalive
+cd instabox-keepalive
+INSTABOX_API_KEY=<你的key> ./disable-sleep-mechanism.sh    # 单次执行
+```
+
+- 用你的 key 列出名下全部机器，逐台把自动挂起设为关闭；幂等，已关闭的跳过，可安全重跑。
+- **一次性**执行，不装服务、不留后台，跑一次就不用管了。
+- 参数：`--key ibk_xxx` 命令行传 key；`--dry-run` 只预览会改哪些，不真改。
+- key 只从环境变量 / `--key` / 本地 `.key` 读，`.key` 已在 `.gitignore`，仓库里不含任何凭证。
+
+## 备用：keepalive.sh 续租保活
+
+不想改机器设置，而是靠官方的 **activity lease** 定期续租，让它一直醒着；不需要在机器里装任何东西。通常首选上面那个一次性办法就够了，这条留作无法改设置时的备用方案。
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**，靠那次请求真的出网。
 
@@ -17,20 +36,6 @@ key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pin
 就一个文件 `keepalive.sh`：不带参数＝安装/更新，`uninstall`＝卸载，`--once` / `--watch` / `--status` / `--release`＝手动用。`sh keepalive.sh --help` 看全部参数。
 
 装完会立刻做一次续租自检，失败就不装。服务形式按系统自动挑：**systemd → OpenRC → cron**。
-
-## 方案二：一次性解除休眠机制
-
-不想靠 keepalive 续租，而是直接把机器的**空闲自动挂起关掉**（`autoSuspendAfterSeconds=0` → `null`＝永不自动挂起），用 `一键解除休眠机制.sh`：
-
-```sh
-INSTABOX_API_KEY=<你的key> ./一键解除休眠机制.sh       # 单次执行
-./一键解除休眠机制.sh --key ibk_xxx                  # 或命令行传 key
-./一键解除休眠机制.sh --dry-run                      # 只预览会改哪些，不真改
-```
-
-- 用你的 key 列出名下全部机器，逐台把自动挂起设为关闭；幂等，已关闭的跳过，可安全重跑。
-- **一次性**执行，不装服务、不留后台；适合想要永久关掉休眠、不想常驻续租的场景。
-- key 只从环境变量 / `--key` / 本地 `.key` 读，和 keepalive.sh 一样不进仓库。
 
 ## 机器名从哪来
 
@@ -147,7 +152,7 @@ https://<你的worker>.workers.dev/release?token=xxx       放掉租约
 
 ## 已知事实（2026-10-16 实测）
 
-- `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0` **被服务端静默忽略**（非 0 值也一样），`instabox auto-suspend <box> 0` 走同一字段，同样无效 —— 所以只能用租约这条官方口子
+- `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0` **实测有效**（2026-10-18，5/5 台都改成功）；响应与后续 `GET` 回显为 `null`（=关）。早期版本判断“被静默忽略”是误报，可能当时机器的 `state` 不为运行或没带 `Idempotency-Key`
 - 租约接口只认**机器 id**，传名字会 `404 machine not found`：脚本内部先用 `GET /v1/machines/{名字}` 换 id
 - 租约 ttl 范围 30–3600 秒，单机最多 128 个；到期后才开始重新计空闲时间
 - 机器 CPU 真忙、或终端有输入输出，本身不算空闲；但 `agent-browser` 模板没有 `activity` capability（`herdr` 有：带 agent 活动探针），跑静默任务才需要保活
