@@ -1,22 +1,8 @@
 # instabox-keepalive
 
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库提供两种办法阻止它休眠：**首选——一次性关掉休眠机制；备用——activity lease 定期续租保活**。
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库用官方的 **activity lease** 定期续租，让它一直醒着；不需要在机器里装任何东西。
 
-## 首选：disable-sleep-mechanism.sh（一次性关掉休眠机制，跑一次就够了）
-
-直接把机器自带的空闲自动挂起**永久关掉**（`autoSuspendAfterSeconds=0` → 服务端记为 `null`＝永不自动挂起）。一条命令，不用克隆也不装任何东西：
-
-```sh
-APIKEY=*** bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/disable-sleep-mechanism.sh)
-```
-
-- 用你的 key 列出名下全部机器，逐台把自动挂起设为关闭；幂等，已关闭的跳过，可安全重跑。
-- **一次性**执行，跑一次就不用管了；重复跑也只是确认一遍。
-- 想预览不真改：`... disable-sleep-mechanism.sh --dry-run`
-
-## 备用：keepalive.sh 续租保活
-
-不想改机器设置，而是靠官方的 **activity lease** 定期续租，让它一直醒着；不需要在机器里装任何东西。通常首选上面那个一次性办法就够了，这条留作无法改设置时的备用方案。
+> **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。详见文末《为什么关不掉休眠》。所以只能用租约这条官方口子。
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**，靠那次请求真的出网。
 
@@ -149,10 +135,38 @@ https://<你的worker>.workers.dev/release?token=xxx       放掉租约
 
 ## 已知事实（2026-10-16 实测）
 
-- `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0` **实测有效**（2026-10-18，5/5 台都改成功）；响应与后续 `GET` 回显为 `null`（=关）。早期版本判断“被静默忽略”是误报，可能当时机器的 `state` 不为运行或没带 `Idempotency-Key`
+- `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds`（0/300/600/1800 都试过）**被服务端静默忽略**：返回 200，值不变，revision 不动；`instabox auto-suspend <box> 0`（同一字段）、SDK `setAutoSuspend()` 同样无效 —— 根因是账号级 `fixedAutoSuspendSeconds`，详见文末
+- `PATCH /v1/machines/{id}` 端点本身正常：同一请求里改 `metadata` 立刻生效（对照实验），所以不是端点或 key 的问题
+- `/v1/me` 只读（只有 GET，PATCH 返回 404 `route not found`），`fixedAutoSuspendSeconds` / `manualLifecycle` 自己改不了
 - 租约接口只认**机器 id**，传名字会 `404 machine not found`：脚本内部先用 `GET /v1/machines/{名字}` 换 id
 - 租约 ttl 范围 30–3600 秒，单机最多 128 个；到期后才开始重新计空闲时间
 - 机器 CPU 真忙、或终端有输入输出，本身不算空闲；但 `agent-browser` 模板没有 `activity` capability（`herdr` 有：带 agent 活动探针），跑静默任务才需要保活
+
+## 为什么关不掉休眠（2026-10-18 实测）
+
+想让机器永不空闲挂起，最直接的想法是 `autoSuspendAfterSeconds=0`。**这条路在普通/邀请制账号上被服务端封死了**，不是字段名或用法的错：
+
+```sh
+# 1) 账号级锁：空闲阈值被服务端钉死，且用户改不了
+curl -s https://api.instabox.sh/v1/me -H "X-API-Key: $KEY"
+# → "fixedAutoSuspendSeconds": 1800, "manualLifecycle": false
+curl -s -X PATCH https://api.instabox.sh/v1/me -H "X-API-Key: $KEY" -d '{}' -H 'Content-Type: application/json'
+# → 404 route not found（/v1/me 只有 GET）
+
+# 2) 改机器字段被静默忽略：200，但值不变
+curl -s -X PATCH https://api.instabox.sh/v1/machines/$MID -H "X-API-Key: $KEY" \
+     -H "Idempotency-Key: $(uuidgen)" -H 'Content-Type: application/json' \
+     -d '{"autoSuspendAfterSeconds":0}'
+# → 200，回包里 autoSuspendAfterSeconds 仍是 1800；等 60s 后 GET 也还是 1800，revision 不动
+
+# 3) 官方 CLI 走的是同一个字段，同样无效（抓包实证）
+instabox -server <mock> auto-suspend <box> 0
+# → PATCH /v1/machines/<id>  {"metadata":null,"autoSuspendAfterSeconds":0}
+```
+
+对照实验排除了“字段名写错 / key 权限不够 / 端点坏了”：同一个 PATCH 端点里改 `metadata` **立刻生效**。
+
+结论：`fixedAutoSuspendSeconds` 是平台侧的账号策略（免费/邀请制账号的防滥用），只有账号本身被改成 `manualLifecycle: true`（或平台侧去掉固定值）才可能真正关掉 —— 这在用户侧没有任何 API 入口。所以本仓库用**租约续租**：它不去改那个字段，而是持续给机器“活动”信号，让 30 分钟空闲永远攒不满。
 
 ## 免责声明
 

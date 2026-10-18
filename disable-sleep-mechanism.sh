@@ -57,17 +57,36 @@ disable_one() {
   fi
   echo "  [改]   $mid ($name) autoSuspend $cur -> 0"
   if [[ $DRY_RUN -eq 1 ]]; then return 0; fi
-  if curl -sf -X PATCH -H "X-API-Key: $AK" -H "Content-Type: application/json" \
+  curl -sf -X PATCH -H "X-API-Key: $AK" -H "Content-Type: application/json" \
        -H "Idempotency-Key: disable-suspend-$(date +%s)-$mid" \
-       -d '{"autoSuspendAfterSeconds":0}' "$API/v1/machines/$mid" >/dev/null; then
-    echo "  [OK]   $mid ($name)"
+       -d '{"autoSuspendAfterSeconds":0}' "$API/v1/machines/$mid" >/dev/null || true
+  # 不信回包，回查真实值：服务端可能静默忽略
+  local after
+  after="$(curl -sf -H "X-API-Key: $AK" "$API/v1/machines/$mid" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("autoSuspendAfterSeconds"))' 2>/dev/null || echo unknown)"
+  if [[ "$after" == "null" || "$after" == "0" || "$after" == "None" ]]; then
+    echo "  [OK]   $mid ($name) 已关闭"
   else
-    echo "  [失败] $mid ($name)" >&2
+    echo "  [无效] $mid ($name) 服务端未接受，仍为 $after"
     return 1
   fi
 }
 
+# 账号级预检：fixedAutoSuspendSeconds 非 0 时，改机器字段一定无效
+account_note() {
+  local fixed
+  fixed="$(curl -sf -H "X-API-Key: $AK" "$API/v1/me" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("fixedAutoSuspendSeconds"))' 2>/dev/null || echo unknown)"
+  if [[ "$fixed" == "0" || "$fixed" == "None" || "$fixed" == "null" ]]; then
+    echo "  账号空闲阈值: 未锁定（fixedAutoSuspendSeconds=$fixed），可以尝试关闭"
+  else
+    echo "  ！账号空闲阈值被服务端锁死: fixedAutoSuspendSeconds=$fixed（/v1/me，只读）"
+    echo "    这会让本脚本对每台机器的修改全部被静默忽略 —— 请改用 keepalive.sh 续租保活。"
+  fi
+}
+
 echo "== $(date '+%F %T') 解除休眠机制 =="
+account_note
 machines="$(list_machines)" || { echo "  (机器列表读取失败)" >&2; exit 1; }
 if [[ -z "$machines" ]]; then
   echo "  (该 key 下没有机器)"
