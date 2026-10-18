@@ -18,6 +18,20 @@ key=ibk_xxxxxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pin
 
 装完会立刻做一次续租自检，失败就不装。服务形式按系统自动挑：**systemd → OpenRC → cron**。
 
+## 方案二：一次性解除休眠机制
+
+不想靠 keepalive 续租，而是直接把机器的**空闲自动挂起关掉**（`autoSuspendAfterSeconds=0` → `null`＝永不自动挂起），用 `一键解除休眠机制.sh`：
+
+```sh
+INSTABOX_API_KEY=<你的key> ./一键解除休眠机制.sh       # 单次执行
+./一键解除休眠机制.sh --key ibk_xxx                  # 或命令行传 key
+./一键解除休眠机制.sh --dry-run                      # 只预览会改哪些，不真改
+```
+
+- 用你的 key 列出名下全部机器，逐台把自动挂起设为关闭；幂等，已关闭的跳过，可安全重跑。
+- **一次性**执行，不装服务、不留后台；适合想要永久关掉休眠、不想常驻续租的场景。
+- key 只从环境变量 / `--key` / 本地 `.key` 读，和 keepalive.sh 一样不进仓库。
+
 ## 机器名从哪来
 
 `machine=qqq` 里的 `qqq` 只是示例，**换成你自己的机器名**。名字由你创建机器时指定（`instabox ls` 或网页面板都能看到），不用记也没关系：
