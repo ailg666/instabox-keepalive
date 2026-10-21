@@ -11,7 +11,9 @@
 
 ## Cloudflare Worker 部署
 
-### 网页面板（推荐，不用装 wrangler）
+推荐网页面板部署（不用装 wrangler），想用命令行看最后面的《CLI 部署》。
+
+### 部署步骤
 
 1. Cloudflare 面板 → `Workers & Pages` → `Create` → `Worker` → 起个名字（例如 `instabox-keepalive`）→ `Deploy`
 2. `Edit code`，把 `worker/worker.js` 的内容整段粘进去（覆盖默认代码）→ `Deploy`
@@ -106,7 +108,7 @@ npx wrangler deploy
 
 部署完打开 `/accounts?token=...`，看到 `#1`、`#2`、`#3` 三行（key 打码）就说明三把 key 都认到了；再打开 `/status?token=...` 看每个账号下的机器。
 
-## VPS 版 keepalive.sh（自己的机器/NAS 上跑）
+## VPS 版 keepalive.sh（自己的机器/NAS 上跑，也支持多账号）
 
 不想用 Cloudflare 就把脚本装到任何一台常开的机器（VPS/NAS/路由器），cron/systemd 定时续租：
 
