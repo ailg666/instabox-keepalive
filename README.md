@@ -1,8 +1,9 @@
 # instabox-keepalive
 
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库用官方的 **activity lease** 定期续租，让它一直醒着；实现是一个 **Cloudflare Worker**：cron 每 9 分钟续一次租，不需要你自己的机器常开，一个 Worker 还能同时带多个账号。
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库用官方的 **activity lease** 定期续租，让它一直醒着，两种跑法都在这个仓库：
 
-代码只有两个文件：`worker/worker.js`（全部逻辑）和 `worker/wrangler.toml`（CLI 部署配置）。
+- **Cloudflare Worker**（推荐）：cron 每 9 分钟续一次租，不需要你自己的机器常开，一个 Worker 能同时带多个账号（多把 key 无限叠加）
+- **VPS shell 脚本**（`keepalive.sh`）：装在你自己的机器/NAS 上定时续租，同样支持 409 自愈（挂起自动唤醒）
 
 > **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。详见文末《为什么关不掉休眠》。所以只能用租约这条官方口子。
 
@@ -53,6 +54,7 @@
 - 带后缀的优先，没写的自动继承不带后缀的全局值；`INSTABOX_MACHINE` 也会继承，所以两个账号机器名不一样时记得写 `INSTABOX_MACHINE_2`
 - 编号可以不连续（只配 `_2` 也能跑）；`INSTABOX_API_KEY_1` 等同于 `INSTABOX_API_KEY`
 - 同一把 key 配了两次只续一次
+- **一个变量塞多把也行（推荐，无限叠加）**：`INSTABOX_API_KEY = "ibk_aaa,ibk_bbb,ibk_ccc"`（逗号分隔）→ 自动按顺序当 1、2、3 号账号，加账号就是往里续一段 `,ibk_xxx`。两种写法混着用也行：显式 `_N` 变量永远占自己的编号，多出来的往外推空位（比如 `INSTABOX_API_KEY="kA,kB"` 且 `_2=kX` → 1=kA、2=kX、3=kB）。单把 key 的老用法不变
 - 每个账号的机器列表分开缓存、分开续租：某个账号 key 失效或机器被挂起，不影响其它账号
 - `/accounts` 看现在认到了几个账号（key 打码）；`?account=2` 只操作 2 号（`/`、`/status`、`/release` 都支持）
 - KV 绑定不用动：还是 `LOG`、还是每小时最多 1 条，多账号只是让每条日志里多几个 `account` 编号
@@ -73,6 +75,20 @@
 
 `INSTABOX_MACHINE` / `INSTABOX_LEASE` / `INSTABOX_AUTO_RESUME` 都不写，效果就是：每个账号保活自己名下**全部机器**、租约名 `keepalive`、碰到挂起/停掉自动唤醒。cron 填 `*/9 * * * *`。
 
+**懒人写法（推荐）**：三种等价 —— 要几个加几个。
+
+```sh
+# 单变量塞多把（推荐）：加账号就是往里续 ",ibk_xxx"
+INSTABOX_API_KEY = ibk_aaa,ibk_bbb,ibk_ccc
+# 或每把一个 secret（老写法，效果一样）
+INSTABOX_API_KEY   = ibk_aaa
+INSTABOX_API_KEY_2 = ibk_bbb
+INSTABOX_API_KEY_3 = ibk_ccc
+# 或混着用（显式 _N 的编号优先，多出来的往外推空位）
+INSTABOX_API_KEY   = ibk_aaa,ibk_bbb
+INSTABOX_API_KEY_2 = ibk_xxx      # 占死 2 号位；任务变成 1=aaa 2=xxx 3=bbb
+```
+
 反过来，如果几个账号都只想保活同名的那台机器（比如都叫 `qqq`），只写一个 `INSTABOX_MACHINE=qqq` 就行，所有账号都会继承这个筛选。
 
 CLI 部署等价操作（`worker/wrangler.toml` 里已经带了 cron 和 `INSTABOX_LEASE_TTL=900`）：
@@ -87,6 +103,22 @@ npx wrangler deploy
 ```
 
 部署完打开 `/accounts?token=...`，看到 `#1`、`#2`、`#3` 三行（key 打码）就说明三把 key 都认到了；再打开 `/status?token=...` 看每个账号下的机器。
+
+## VPS 版 keepalive.sh（自己的机器/NAS 上跑）
+
+不想用 Cloudflare 就把脚本装到任何一台常开的机器（VPS/NAS/路由器），cron/systemd 定时续租：
+
+```sh
+# 一行装好（key 只落本机 0600 的 .env）；机器名留空 = 保全部
+key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+# 也支持机器内逗号分隔多把 key（每把 key 各保各的），无限叠加、单个也能跑：
+key=ibk_aaa,ibk_bbb,ibk_ccc machine=qqq,box2 bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+```
+
+- 装完自动 systemd/OpenRC/cron 三选一，看 `sh keepalive.sh --status`；卸载 `sh keepalive.sh uninstall`
+- `INSTABOX_AUTO_RESUME` 默认开：续租遇 409 先 resume（stopped 用 start 兜底）再续；`INSTABOX_WAKE_GAP`/`INSTABOX_WAKE_TRIES` 控制唤醒轮询（5s × 3 次）
+- 多把 key：`.env` 里 `INSTABOX_API_KEY=ibk_aaa,ibk_bbb`，脚本逐把续租；以后加 key 直接往变量后面续逗号
+- 重跑安装命令 = 按现有 `.env` 升级，key 不会丢
 
 ## 机器被挂起/停掉会怎样
 

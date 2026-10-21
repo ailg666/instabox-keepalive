@@ -72,11 +72,23 @@ function setting(env, name, n) {
   return "";
 }
 
-// 从 env 里找出所有 INSTABOX_API_KEY / INSTABOX_API_KEY_2 / _3 ……，按编号排序
+// 从 env 里找出所有 INSTABOX_API_KEY / INSTABOX_API_KEY_2 / _3 ……，按编号排序。
+// 单个变量里也能塞多把 key：INSTABOX_API_KEY="ibk_aaa,ibk_bbb"（逗号分隔）→
+// 按顺序拆成 1 号、2 号账号。多余的 key 往后找空位；显式 _N 变量永远优先占自己的编号。
 const KEY_RE = /^INSTABOX_API_KEY(?:_(\d+))?$/;
+
+// 单值里的多把 key："ibk_aaa, ibk_bbb, ibk_ccc" → [ibk_aaa, ibk_bbb, ibk_ccc]
+function splitKeys(value) {
+  return String(value ?? "")
+    .split(/,+/)
+    .map((k) => k.trim())
+    .filter(Boolean);
+}
 
 function accountKeys(env) {
   const byNumber = new Map();
+  const explicit = new Set();
+  // 第一遍：每个编号变量认领自己的编号（同一编号两把不同 key，不带后缀的优先）
   for (const [name, value] of Object.entries(env)) {
     const m = KEY_RE.exec(name);
     if (!m) continue;
@@ -84,18 +96,36 @@ function accountKeys(env) {
     if (!key) continue;
     const n = m[1] ? Number.parseInt(m[1], 10) : 1;
     if (!Number.isSafeInteger(n) || n < 1) continue;
-    const suffixed = !!m[1];
+    explicit.add(n);
+    const keys = splitKeys(value);
     const prev = byNumber.get(n);
+    const entry = { key: keys[0], name, suffixed: !!m[1], origin: name };
     if (!prev) {
-      byNumber.set(n, { key, name, suffixed });
-      continue;
+      byNumber.set(n, entry);
+    } else {
+      const winner = prev.suffixed && !entry.suffixed ? entry : prev;
+      if (prev.key !== keys[0]) {
+        console.warn(
+          `instabox-keepalive: ${prev.origin} 和 ${name} 都是 ${n} 号账号但 key 不同，用 ${winner.origin}`,
+        );
+      }
+      byNumber.set(n, winner);
     }
-    // 同一个编号配了两把不同的 key：不带后缀的优先，否则保留先扫到的
-    const winner = prev.suffixed && !suffixed ? { key, name, suffixed } : prev;
-    if (prev.key !== key) {
-      console.warn(`instabox-keepalive: ${prev.name} 和 ${name} 都是 ${n} 号账号但 key 不同，用 ${winner.name}`);
+  }
+  // 第二遍：把每个变量里逗号分隔的“第二把以后”的 key 外推到空编号；
+  // 显式 _N 的编号永不被外推挤占（explicit 里有记录）
+  for (const [name, value] of Object.entries(env)) {
+    const m = KEY_RE.exec(name);
+    if (!m) continue;
+    const s = String(value ?? "").trim();
+    if (!s) continue;
+    const n = m[1] ? Number.parseInt(m[1], 10) : 1;
+    if (!Number.isSafeInteger(n) || n < 1) continue;
+    for (const k of splitKeys(s).slice(1)) {
+      let e = n;
+      while (byNumber.has(e) || explicit.has(e)) e += 1;
+      byNumber.set(e, { key: k, name: `${name}#${e}`, suffixed: true, origin: `${name} 里第 ${e - n + 1} 把` });
     }
-    byNumber.set(n, winner);
   }
   return [...byNumber.entries()].sort((a, b) => a[0] - b[0]);
 }

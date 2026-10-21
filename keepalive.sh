@@ -33,6 +33,9 @@
 #     INSTABOX_AUTO_RESUME   1（默认）：机器被挂起/停掉时先 resume（stopped 用 start 兜底）再续租；0=只报错不唤醒
 #     INSTABOX_API_URL       API 地址（默认 https://api.instabox.sh）
 #
+#   多账号：key=ibk_aaa,ibk_bbb,ibk_cc3（逗号分隔，无限叠加；单把也行）
+#     每把 key 名下的机器各自保活；加 key 就往变量里续一段,ibk_xxx 再重装一次
+#
 # 机器被挂起后机器内部的定时器也会冻结，所以续租必须从机器外面打进来。
 set -u
 
@@ -297,16 +300,62 @@ each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 	return 0
 }
 
-renew() { preflight && each_machine renew_one; }
-release() { preflight && each_machine release_one; }
-status() { preflight && each_machine status_one; }
+# 逗号分隔的 key 列表 -> 逐把执行（空段/重复跳过）
+# KEY 第 1 把 = 主 key（空 KEY 报错在 preflight），后面每把都当独立账号跑一轮
+each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量 kfn，避免与 each_machine 的 fn 踩踏）
+	kfn=$1
+	printf '%s\n' "$KEY" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "${TMPDIR:-/tmp}/ibk-keys.$$"
+	# 去重保序
+	awk '!seen[$0]++' "${TMPDIR:-/tmp}/ibk-keys.$$" > "${TMPDIR:-/tmp}/ibk-keys.$$.uniq"
+	mv "${TMPDIR:-/tmp}/ibk-keys.$$.uniq" "${TMPDIR:-/tmp}/ibk-keys.$$"
+	total=$(wc -l < "${TMPDIR:-/tmp}/ibk-keys.$$" | tr -d ' ')
+	n=0
+	failkeys=${TMPDIR:-/tmp}/instabox-keys-fail.$$
+	: > "$failkeys"
+	while IFS= read -r k; do
+		n=$((n + 1))
+		KEY=$k
+		if [ "$total" -gt 1 ]; then
+			log "== 账号 $n/$total（key $(mask "$k")）=="
+		fi
+		if ! "$kfn"; then
+			echo x >> "$failkeys"
+		fi
+	done < "${TMPDIR:-/tmp}/ibk-keys.$$"
+	rm -f "${TMPDIR:-/tmp}/ibk-keys.$$" "$failkeys"
+	# any 失败 -> 1（逐把互不影响，全跑完再统一退码）
+	return 0
+}
+
+renew() { each_key renew_round; }
+
+renew_round() { # 每把 key 一轮：校验 → 机器筛选 → 逐台续租
+	preflight_nocall && resolve && each_machine renew_one
+}
+
+preflight_nocall() {
+	command -v curl >/dev/null 2>&1 || die "缺 curl（Alpine: apk add curl / Debian: apt-get install -y curl）"
+	[ -n "$KEY" ] || die "未设置 INSTABOX_API_KEY（或 key=…）"
+	if [ "$ALL" -eq 0 ]; then
+		[ -n "$MACHINE" ] || die "未设置 INSTABOX_MACHINE（填名字、填 all、或留空表示全部）"
+	fi
+	case "$TTL" in ''|*[!0-9]*) die "TTL 必须是数字: $TTL" ;; esac
+	if [ "$TTL" -lt 30 ] || [ "$TTL" -gt 3600 ]; then
+		die "TTL 必须在 30-3600 秒之间（当前 $TTL）"
+	fi
+	return 0
+}
+release() { each_key release_round; }
+status() { each_key status_round; }
+
+release_round() { preflight_nocall && resolve && each_machine release_one; }
+status_round() { preflight_nocall && resolve && each_machine status_one; }
 
 run_once() { # 一次续租（cron / 冒烟测试用）
 	load_env "$SELF_DIR"
 	reload_runtime
 	renew
 }
-
 run_watch() { # 常驻（systemd / OpenRC 用）
 	load_env "$SELF_DIR"
 	reload_runtime
