@@ -5,11 +5,13 @@
 - **Cloudflare Worker**（推荐）：cron 每 9 分钟续一次租，不需要你自己的机器常开，一个 Worker 能同时带多个账号（多把 key 无限叠加）
 - **VPS shell 脚本**（`keepalive.sh`）：装在你自己的机器/NAS 上定时续租，同样支持 409 自愈（挂起自动唤醒）
 
-> **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。详见文末《为什么关不掉休眠》。所以只能用租约这条官方口子。
+> **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。所以只能用租约这条官方口子。
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**，靠那次请求真的出网 —— 这也是把续租放到 Cloudflare Worker 上的原因。
 
-## cloudflare的worker部署（网页面板，推荐，不用装 wrangler）
+## Cloudflare Worker 部署
+
+### 网页面板（推荐，不用装 wrangler）
 
 1. Cloudflare 面板 → `Workers & Pages` → `Create` → `Worker` → 起个名字（例如 `instabox-keepalive`）→ `Deploy`
 2. `Edit code`，把 `worker/worker.js` 的内容整段粘进去（覆盖默认代码）→ `Deploy`
@@ -109,16 +111,51 @@ npx wrangler deploy
 不想用 Cloudflare 就把脚本装到任何一台常开的机器（VPS/NAS/路由器），cron/systemd 定时续租：
 
 ```sh
-# 一行装好（key 只落本机 0600 的 .env）；机器名留空 = 保全部
+# 保活名下全部机器（有几台保几台，机器名都不用填）
 key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
-# 也支持机器内逗号分隔多把 key（每把 key 各保各的），无限叠加、单个也能跑：
-key=ibk_aaa,ibk_bbb,ibk_ccc machine=qqq,box2 bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+
+# 只保某一台
+key=ibk_xxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+
+# 非 root： curl -Ls <同一个地址> | sudo -E env key=ibk_xxx machine=qqq sh
+
+# 多账号：key 逗号分隔多把，每把 key 各保各的，无限叠加、单个也能跑
+key=ibk_aaa,ibk_bbb,ibk_ccc bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
 ```
 
-- 装完自动 systemd/OpenRC/cron 三选一，看 `sh keepalive.sh --status`；卸载 `sh keepalive.sh uninstall`
-- `INSTABOX_AUTO_RESUME` 默认开：续租遇 409 先 resume（stopped 用 start 兜底）再续；`INSTABOX_WAKE_GAP`/`INSTABOX_WAKE_TRIES` 控制唤醒轮询（5s × 3 次）
-- 多把 key：`.env` 里 `INSTABOX_API_KEY=ibk_aaa,ibk_bbb`，脚本逐把续租；以后加 key 直接往变量后面续逗号
-- 重跑安装命令 = 按现有 `.env` 升级，key 不会丢
+就一个文件：不带参数＝安装/更新，`uninstall`＝卸载，`--once` / `--watch` / `--status` / `--release`＝手动用，`--help` 看全部参数。装完会立刻做一次续租自检，失败就不装；服务形式按系统自动挑 **systemd → OpenRC → cron**。
+
+想升级直接再跑一次安装命令（按现有 `.env` 重装，key 不会丢）；以后加账号就是往 `.env` 的 `INSTABOX_API_KEY` 后面续 `,ibk_xxx`。
+
+**机器筛选**
+
+- 不填 `machine`（推荐）：脚本用你的 key 调 `GET /v1/machines` 自己列出名下所有机器，全部保活，新加机器下一轮自动跟上
+- 填 `machine=qqq` 只保这一台；也可以填机器 id（`m_...`）；`machine=all` 和不填一样
+- 多把 key 时 `machine` 对每把 key 各自生效（比如 `machine=qqq` 就是每把 key 各保自己名下的 `qqq`）
+
+**日常**
+
+```sh
+sh /root/instabox-keepalive/keepalive.sh --status    # 机器状态（不填机器=全部）
+sh /root/instabox-keepalive/keepalive.sh --once      # 手动续一次
+sh /root/instabox-keepalive/keepalive.sh --release   # 放掉租约，恢复空闲休眠
+sh /root/instabox-keepalive/keepalive.sh uninstall   # 彻底卸载（停服务、删 unit、清 cron、放租约、删目录）
+```
+
+**变量**（`.env` 或安装环境变量；`--dir` 默认 `/root/instabox-keepalive`，`--service` 默认 `instabox-keepalive`，还有 `--lease` `--ttl` `--raw` `--cron` `--no-start`）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `INSTABOX_API_KEY` | 无（必填） | `ibk_...`，多把逗号分隔 |
+| `INSTABOX_MACHINE` | 空＝全部 | 机器名 / id / `all` |
+| `INSTABOX_LEASE` | `keepalive` | 租约名 |
+| `INSTABOX_LEASE_TTL` | `300` | 秒，30–3600 |
+| `INSTABOX_RENEW_EVERY` | `0.6 × ttl` | 续租间隔 |
+| `INSTABOX_AUTO_RESUME` | `1` | 遇 409 先 resume（stopped 用 start 兜底）再续；`0` 只报错不唤醒 |
+| `INSTABOX_WAKE_GAP` / `INSTABOX_WAKE_TRIES` | `5` / `3` | 唤醒后轮询间隔/次数 |
+| `INSTABOX_API_URL` | `https://api.instabox.sh` | 换私有网关时才用 |
+
+**密钥安全**：key 只落本机 `<安装目录>/.env`（0600，不进进程列表）；安装时 key 会出现在命令行一次，装完记得 `history -c`；建议只用 `machines:write` 权限的 key。
 
 ## 机器被挂起/停掉会怎样
 
@@ -152,7 +189,7 @@ https://<你的worker>.workers.dev/status?token=xxx&account=2   只看 2 号账�
 
 也就是说：间隔 4 分钟以上用默认值随便跑；间隔 1 分钟的 `every` 会超额度，这时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
 
-## CLI 部署（可选）
+## CLI 部署（可选，用 wrangler）
 
 ```sh
 cd worker
@@ -168,4 +205,6 @@ npx wrangler deploy
 
 仅用于管理你自己账号下的 InstaBox 机器。请自行确认每把 key 的权限范围与所在机器的可信程度 —— Worker 能读到这些 key，能读到它们的人也能操作你的机器。使用本项目产生的一切后果由使用者自行承担。
 
-[MIT](LICENSE) © 2026
+## License
+
+MIT © 2026 pingmike2
