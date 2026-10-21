@@ -20,6 +20,8 @@ INSTABOX_AUTO_RESUME = "1"
 # 多账号：第 N 个账号 = 单账号变量名加 _N 后缀，加一个账号就多存一个 secret（别把 key 写进这个文件）：
 #   npx wrangler secret put INSTABOX_API_KEY_2      # 2 号账号
 #   npx wrangler secret put INSTABOX_API_KEY_3      # 3 号账号，依此类推
+# 也可以在一个变量里塞多把：INSTABOX_API_KEY="ibk_aaa,ibk_bbb,ibk_ccc"（逗号分隔，
+# 按顺序当 1、2、3 号账号）；两种写法混着用也行，显式 _N 的编号优先。
 # 每个账号还可以用 INSTABOX_MACHINE_2 / INSTABOX_LEASE_2 / INSTABOX_LEASE_TTL_2 / INSTABOX_AUTO_RESUME_2
 # 单独覆盖，不写就继承不带后缀的全局值（见 README《多个账号》）
 # TOKEN = "换成一串随机值，所有请求都要带 ?token=..."
