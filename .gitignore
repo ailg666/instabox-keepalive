@@ -1,7 +1,5 @@
-.env
-*.log
 node_modules/
 .wrangler/
 .dev.vars
-.key
-install.conf
+*.log
+.DS_Store
