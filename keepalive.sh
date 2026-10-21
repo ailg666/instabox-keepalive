@@ -138,9 +138,15 @@ for m in d.get("machines") or []:
 	else
 		printf '%s' "$HTTP_BODY" | awk '
 			function getv(o, k,   s, r) {
-				s = index(o, "\"" k "\":\"")
-				if (s == 0) { return "" }
-				r = substr(o, s + length(k) + 4)
+				# 冒号后带/不带空格都要吃："k":"v" 和 "k": "v"
+				s = index(o, "\"" k "\": \"")
+				if (s == 0) {
+					s = index(o, "\"" k "\":\"")
+					if (s == 0) { return "" }
+					r = substr(o, s + length(k) + 4)
+				} else {
+					r = substr(o, s + length(k) + 5)
+				}
 				return substr(r, 1, index(r, "\"") - 1)
 			}
 			function emit(o,   id, nm) {
@@ -150,8 +156,13 @@ for m in d.get("machines") or []:
 			}
 			{
 				line = $0
-				i = index(line, "\"machines\":[")
-				if (i > 0) { line = substr(line, i + 12) } else { line = "" }
+				# "machines":[ 或 "machines": [（冒号后带不带空格两种 API 形态都吃）；
+				# busybox awk 不把 match() 当 pattern，用 if
+				if (match(line, /"machines"[ 	]*:[ 	]*\[/)) {
+					line = substr(line, RSTART + RLENGTH)
+				} else {
+					line = ""
+				}
 				depth = 0; buf = ""; started = 0
 				for (p = 1; p <= length(line); p++) {
 					c = substr(line, p, 1)
