@@ -8,7 +8,7 @@
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**，靠那次请求真的出网 —— 这也是把续租放到 Cloudflare Worker 上的原因。
 
-## 部署（网页面板，推荐，不用装 wrangler）
+## cloudflare的worker部署（网页面板，推荐，不用装 wrangler）
 
 1. Cloudflare 面板 → `Workers & Pages` → `Create` → `Worker` → 起个名字（例如 `instabox-keepalive`）→ `Deploy`
 2. `Edit code`，把 `worker/worker.js` 的内容整段粘进去（覆盖默认代码）→ `Deploy`
@@ -23,7 +23,7 @@
    | `INSTABOX_LEASE_TTL` | Text | `900`（建议；不填默认 300，会比 cron 间隔小） |
    | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
    | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先 `resume`（stopped 用 `start` 兜底）再续租；设 `0` 只报错不唤醒 |
-   | `INSTABOX_API_URL` | Text | `https://api.instabox.sh`（换私有网关时才用） |
+   | `INSTABOX_API_URL` | Text | `https://api.instabox.sh`（换私有网关时才用加这个变量） |
 
    > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
    > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 9 分钟就填 `900`，填 `300` 会在两次续租之间出现空窗。
@@ -32,14 +32,14 @@
 
 **机器筛选**
 
-- 不填 `INSTABOX_MACHINE`（推荐）：Worker 用你的 key 调 `GET /v1/machines` 自己列出名下所有机器，全部保活 —— 一个账号默认 5 台，新加机器下一轮自动跟上
+- 不填 `INSTABOX_MACHINE`（推荐）：Worker 用你的 key 调 `GET /v1/machines` 自己列出名下所有机器，全部保活 —— 一个账号默认 支持多台，新加机器下一轮自动跟上
 - 填 `qqq` 只保这一台；也可以填机器 id（`m_...`）；多台用逗号分隔，例如 `qqq,box2`
 - 机器名由你创建机器时指定（`instabox ls` 或网页面板都能看到）
 - 租约是**每台机器各一份**，名字相同也不会互相干扰
 
 ## 多个账号
 
-不用学新语法：**一个账号就是一套单账号变量，第 N 个账号的变量名加 `_N` 后缀**。
+**一个账号就是一套单账号变量，第 N 个账号的变量名加 `_N` 后缀**。
 
 | 1 号账号（和单账号完全一样） | 2 号账号 | 说明 |
 | --- | --- | --- |
@@ -131,50 +131,9 @@ npx wrangler deploy
 
 `worker/wrangler.toml` 里已经设好 `crons = ["*/9 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
 
-## 密钥安全
-
-- 仓库里**没有也不该有**任何 key；key 只存在 Cloudflare 的 Secret 里，本地开发用 `.dev.vars`（已被 `.gitignore`）
-- `TOKEN` 强烈建议一定要设，否则任何知道你 Worker 域名的人都能触发续租/释放
-- 建议每把 key 只开 `machines:write`（需要 exec 时再加 `machines:exec`），不要用账号的全权 key；多账号时每把 key 单独授权、单独吊销
-- 能读到这些 key 的人也能操作你的机器，Secret 的访问权限按 Cloudflare 账号权限控制好
-
-## 已知事实（2026-10-16 实测）
-
-- `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds`（0/300/600/1800 都试过）**被服务端静默忽略**：返回 200，值不变，revision 不动；`instabox auto-suspend <box> 0`（同一字段）、SDK `setAutoSuspend()` 同样无效 —— 根因是账号级 `fixedAutoSuspendSeconds`，详见文末
-- `PATCH /v1/machines/{id}` 端点本身正常：同一请求里改 `metadata` 立刻生效（对照实验），所以不是端点或 key 的问题
-- `/v1/me` 只读（只有 GET，PATCH 返回 404 `route not found`），`fixedAutoSuspendSeconds` / `manualLifecycle` 自己改不了
-- 租约接口只认**机器 id**，传名字会 `404 machine not found`：Worker 内部先用 `GET /v1/machines/{名字}` 换 id
-- 租约 ttl 范围 30–3600 秒，单机最多 128 个；到期后才开始重新计空闲时间
-- 机器 CPU 真忙、或终端有输入输出，本身不算空闲；但 `agent-browser` 模板没有 `activity` capability（`herdr` 有：带 agent 活动探针），跑静默任务才需要保活
-
-## 为什么关不掉休眠（2026-10-18 实测）
-
-想让机器永不空闲挂起，最直接的想法是 `autoSuspendAfterSeconds=0`。**这条路在普通/邀请制账号上被服务端封死了**，不是字段名或用法的错：
-
-```sh
-# 1) 账号级锁：空闲阈值被服务端钉死，且用户改不了
-curl -s https://api.instabox.sh/v1/me -H "X-API-Key: $KEY"
-# → "fixedAutoSuspendSeconds": 1800, "manualLifecycle": false
-curl -s -X PATCH https://api.instabox.sh/v1/me -H "X-API-Key: $KEY" -d '{}' -H 'Content-Type: application/json'
-# → 404 route not found（/v1/me 只有 GET）
-
-# 2) 改机器字段被静默忽略：200，但值不变
-curl -s -X PATCH https://api.instabox.sh/v1/machines/$MID -H "X-API-Key: $KEY" \
-     -H "Idempotency-Key: $(uuidgen)" -H 'Content-Type: application/json' \
-     -d '{"autoSuspendAfterSeconds":0}'
-# → 200，回包里 autoSuspendAfterSeconds 仍是 1800；等 60s 后 GET 也还是 1800，revision 不动
-
-# 3) 官方 CLI 走的是同一个字段，同样无效（抓包实证）
-instabox -server <mock> auto-suspend <box> 0
-# → PATCH /v1/machines/<id>  {"metadata":null,"autoSuspendAfterSeconds":0}
-```
-
-对照实验排除了“字段名写错 / key 权限不够 / 端点坏了”：同一个 PATCH 端点里改 `metadata` **立刻生效**。
-
-结论：`fixedAutoSuspendSeconds` 是平台侧的账号策略（免费/邀请制账号的防滥用），只有账号本身被改成 `manualLifecycle: true`（或平台侧去掉固定值）才可能真正关掉 —— 这在用户侧没有任何 API 入口。所以本仓库用**租约续租**：它不去改那个字段，而是持续给机器“活动”信号，让 30 分钟空闲永远攒不满。
 
 ## 免责声明
 
 仅用于管理你自己账号下的 InstaBox 机器。请自行确认每把 key 的权限范围与所在机器的可信程度 —— Worker 能读到这些 key，能读到它们的人也能操作你的机器。使用本项目产生的一切后果由使用者自行承担。
 
-[MIT](LICENSE) © 2026 pingmike2
+[MIT](LICENSE) © 2026
