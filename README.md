@@ -6,6 +6,24 @@
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**、靠那次出网请求带出去 —— 这也是 Worker 版要放到 Cloudflare 的原因；`keepalive.sh` 装在你自己的常开机器上，同样满足。
 
+## 先拿到 API key（`ibk_...`）
+
+下面的 `key=ibk_xxx` 全都要换成你自己的 key。key 不在命令里生成，是登录 [instabox.sh](https://instabox.sh) 网页后在账号菜单建：
+
+1. 打开 [instabox.sh](https://instabox.sh)，用 GitHub 或 Google 登录进控制台
+2. 点右上角**账号菜单 → Profile → API keys**
+3. 点 **Create Key**，权限二选一：
+   - **Full access** —— 全权限，省事
+   - **Restricted** —— 自己勾 scope；**只做保活用 `machines:write` 就够**（write 含 read；`machines:delete`、`images:*` 都不需要）
+4. 建完**立刻复制**：key 只在创建时显示一次，弹窗关了网页上再也看不到，丢了只能删掉重建
+
+几个容易踩的点：
+
+- key 长这样 `ibk_...`；GitHub/Google 登录只用来进控制台和建 key，**不能拿登录态当 key 用**
+- 一把 key 对应一个账号。多个账号就建多把，安装时逗号连起来：`key=ibk_aaa,ibk_bbb`
+- key 泄露或要换：到同一个 **API keys** 页面 revoke 旧的、建新的，然后改本机 `.env`（见下文）
+- 官方文档：<https://instabox.sh/docs/keys-sdk>
+
 ## VPS 版 keepalive.sh：一键安装
 
 把脚本装到任何一台常开的机器（VPS/NAS/路由器），cron/systemd 定时续租，也支持多账号：
@@ -58,6 +76,8 @@ sh /root/instabox-keepalive/keepalive.sh uninstall   # 彻底卸载（停服务�
 **密钥安全**：key 只落本机 `<安装目录>/.env`（0600，不进进程列表）；安装时 key 会出现在命令行一次，装完记得 `history -c`；建议只用 `machines:write` 权限的 key。
 
 ## 多个账号（两种跑法通用）
+
+每个账号要一把**各自独立**的 key——都在同一个 **Profile → API keys** 页面里分别 Create Key（换台账号就先用那个账号登录一次网页建 key，见上文「先拿到 API key」）。
 
 `keepalive.sh` 和 Worker 都支持多账号：**第 N 个账号的变量名 = 单账号变量名 + `_N` 后缀**（脚本里也可以直接 `key=ibk_aaa,ibk_bbb`）。
 
