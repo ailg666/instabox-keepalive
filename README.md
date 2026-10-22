@@ -214,10 +214,17 @@ npx wrangler deploy
 
 `worker/wrangler.toml` 里已经设好 `crons = ["*/9 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
 
+## 致谢
+
+| 项目 | 在本项目里干什么活 |
+| --- | --- |
+| [InstaBox](https://instabox.sh) | 提供机器与官方 `activity lease` 接口，[文档](https://instabox.sh/docs/keys-sdk)里写清了 key 与租约用法 |
+| [jyucoeng/instabox-keepalive](https://github.com/jyucoeng/instabox-keepalive) | 早期 Worker 版的多账号实现，本项目在其基础上合并了 VPS 版与 409 自愈 |
+
 ## 免责声明
 
 仅用于管理你自己账号下的 InstaBox 机器。请自行确认每把 key 的权限范围与所在机器的可信程度 —— Worker 能读到这些 key，能读到它们的人也能操作你的机器。使用本项目产生的一切后果由使用者自行承担。
 
 ## License
 
-MIT © 2026 pingmike2
+[MIT](./LICENSE) © 2026 [pingmike2](https://github.com/pingmike2)
