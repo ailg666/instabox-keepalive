@@ -315,6 +315,9 @@ each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 # KEY 第 1 把 = 主 key（空 KEY 报错在 preflight），后面每把都当独立账号跑一轮
 each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量 kfn，避免与 each_machine 的 fn 踩踏）
 	kfn=$1
+	# 没给 key 的时候直接报错退出：以前这里会静默跑完 0 个账号、退码 0，
+	# 定时任务看着"成功"，其实一次都没续
+	[ -n "$(printf '%s' "$KEY" | tr -d ' 	\n')" ] || die "未设置 INSTABOX_API_KEY（或 key=…）"
 	printf '%s\n' "$KEY" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "${TMPDIR:-/tmp}/ibk-keys.$$"
 	# 去重保序
 	awk '!seen[$0]++' "${TMPDIR:-/tmp}/ibk-keys.$$" > "${TMPDIR:-/tmp}/ibk-keys.$$.uniq"

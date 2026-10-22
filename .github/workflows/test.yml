@@ -1,0 +1,74 @@
+name: test
+
+# 改了 keepalive.sh / worker.js / tools 就跑回归：全用假 key 打本地假 API，
+# 不碰真账号、不发真请求（见 tools/mock_api.py）。
+# main 上测试挂了会自动 git revert 触发它的那次提交（测试机器人自己 push 的
+# revert 不会再次触发本工作流，天然无循环）。
+on:
+  push:
+    branches: [main]
+    paths:
+      - keepalive.sh
+      - worker/**
+      - tools/**
+      - .github/workflows/test.yml
+  pull_request:
+    paths:
+      - keepalive.sh
+      - worker/**
+      - tools/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu：dash + bash，覆盖面最全
+          - label: ubuntu
+            container: ''
+          # alpine：和 NAT 机器同款 busybox（sh/awk 都是 busybox 实现）
+          - label: alpine-3.22
+            container: alpine:3.22
+
+    container: ${{ matrix.container }}
+
+    steps:
+      - name: 装依赖（alpine 容器）
+        if: matrix.container != ''
+        run: apk add --no-cache curl python3 nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: 跑回归（${{ matrix.label }}）
+        run: sh tools/run_tests.sh all
+
+  revert:
+    # 只在 main 分支 push 挂掉时回退；PR 挂了什么都不做
+    needs: test
+    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 回退触发失败的那次提交
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git revert --no-edit '${{ github.sha }}'
+          git push origin HEAD:refs/heads/main
+          echo '::warning::测试未通过，已自动回退 ${{ github.sha }}'
