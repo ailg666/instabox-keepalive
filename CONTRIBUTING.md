@@ -12,25 +12,18 @@
 
 ## 测试环境
 
-改 `keepalive.sh` 前先把本地验证跑绿，不许只靠肉眼读 diff：
+改 `keepalive.sh` / `worker/worker.js` 前先把回归套件跑绿，不许只靠肉眼读 diff：
 
 ```sh
-# 1. 语法（宿主 dash + 目标环境 busybox 双重校验）
-sh -n keepalive.sh
-docker run --rm -v "$PWD:/repo:ro" alpine:3.22 sh -n /repo/keepalive.sh
-
-# 2. 真脚本端到端（不需要真 key，起本地假 API 即可）
-#    假 API 至少要能模拟：正常续租、409 suspended、stopped(resume 被拒) 三个场景
-docker run --rm --add-host=host.docker.internal:host-gateway \
-  -e INSTABOX_API_URL=http://host.docker.internal:8897 \
-  -e INSTABOX_API_KEY=ibk_dummy \
-  -v "$PWD:/repo:ro" alpine:3.22 \
-  sh -c 'apk add --no-cache -q curl >/dev/null && INSTABOX_ENV_FILE=/dev/null sh /repo/keepalive.sh --status'
+sh tools/run_tests.sh          # 全部（shell + worker）
+sh tools/run_tests.sh shell    # 只测 keepalive.sh
+sh tools/run_tests.sh worker   # 只测 worker.js
 ```
 
-- **基准容器固定 `alpine:3.22`**（NAT 机器实际跑的就是这版，busybox 1.37）。别的版本跑绿不算数。
-- 测试**不许打真 API、不许用真 key**：所有用例对本地假服务（`http://127.0.0.1:PORT`）发请求，`INSTABOX_API_URL` 指过去即可。
-- 测 `409` 自愈必须真的制造 409：假 API 先返回 `{"code":"machine_not_running"}`，`resume` 一次后才转 `running`，脚本要能 `resume → 等 running → 续租成功`；`stopped` 场景要能验证 `/start` 兜底。
+- 套件对 **本地假 API**（`tools/mock_api.py`，端口由内核挑，永远不撞车）发请求，全程假 key（`ibk_testkey0001`），**不打真 API、不用真 key**。
+- 套件覆盖：正常续租、`--status`、awk 降级两种 JSON 形态、`409` 自愈（resume 唤醒 / stopped 走 `/start` 兜底 / 唤不醒要如实失败）、`--release`、多 key 逗号逐账号、缺 key 拒绝（非 0 退码）、TTL 越界；worker 侧多账号识别、key 打码、TOKEN 校验、`/status`、`/dead` 如实 502。
+- **基准环境两件套**：宿主（dash）+ `alpine:3.22`（busybox 1.37，NAT 机器同款）——CI 矩阵同款：
+  `docker run --rm -v "$PWD:/repo:ro" -w /repo alpine:3.22 sh -c 'apk add --no-cache -q curl python3 nodejs && sh tools/run_tests.sh all'`
 - 改完贴出**实际命令输出**，不要写「应该没问题」。
 
 ## 改 Worker
@@ -47,7 +40,11 @@ docker run --rm --add-host=host.docker.internal:host-gateway \
 - 改了用户可见行为，README 里示例命令要能**复制即跑**，不许留 `xxx` 省略号以外的假占位。
 - 提 PR 前自查敏感信息：`grep -rniE "ibk_|secret|token|api[_-]?key" . --exclude-dir=.git`，确认没有真实凭据。
 
+## CI
+
+`.github/workflows/test.yml`：`keepalive.sh` / `worker/**` / `tools/**` 有改动即触发（push 到 main 或 PR），矩阵跑 ubuntu（dash/bash）+ **alpine:3.22（busybox）** 两套，全程假 key + 本地假 API。main 上测试挂了，CI 自动 `git revert` 肇事提交并推回 main（机器人 push 的 revert 不再触发本工作流，无循环）。
+
 ## 发版
 
-- 主分支没有测试工作流，**发版闸门在 tag**：`git tag vX.Y.Z && git push origin vX.Y.Z` 前先把上面测试节跑绿。
+- **发版闸门在 CI**：main 必须绿；tag 前确认 `tools/run_tests.sh` 全绿（本地同款命令见测试节）。
 - 版本号改动落在：README 开头的说明（如有）、`worker/wrangler.toml` 注释与 `keepalive.sh` 头部注释保持一致，不要只改一处。
