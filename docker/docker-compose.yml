@@ -1,0 +1,36 @@
+services:
+  instabox-keepalive:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: instabox-keepalive:latest
+    container_name: instabox-keepalive
+    restart: unless-stopped
+
+    # init 负责回收 sleep 子进程、转发信号，docker stop 才干净
+    init: true
+
+    # key 只从 .env 读，不进命令行
+    env_file: .env
+    # 不想用 env_file 也可以直接写 environment：
+    # environment:
+    #   INSTABOX_API_KEY: ibk_xxx
+    #   INSTABOX_MACHINE: all
+
+    environment:
+      # 冷启动唤醒实测偶尔超过默认的 3×5s=15s 窗口，放大到 6×5s=30s。
+      # 容器里没人盯着日志，宁可多等一会儿再判失败。
+      INSTABOX_WAKE_TRIES: "6"
+
+    # 脚本把失败标记写在 /tmp，其余只读即可
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

@@ -1,0 +1,7 @@
+# 统一用 LF：keepalive.sh 要进 Alpine 容器执行，CRLF 会报 "\r: not found"
+* text=auto eol=lf
+
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.md            text eol=lf
