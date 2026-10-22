@@ -674,6 +674,3 @@ case "${1:-}" in
 		exit 2
 		;;
 esac
-
-# 故意破坏：缺一个引号
-echo "broken
