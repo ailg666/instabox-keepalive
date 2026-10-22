@@ -3,7 +3,7 @@
 # InstaBox keepalive 的容器版：镜像里装的就是本仓库自带的 keepalive.sh，
 # 入口直接跑 `keepalive.sh --watch`，逻辑零重复 —— 脚本更新后重新 build 即可。
 # 变量名、多账号写法和 VPS 版完全一致，不需要重新学一套配置。
-FROM alpine:3.21
+FROM alpine:3.22
 
 # keepalive.sh 只依赖 curl；jq 用来解析 /v1/machines，没有时脚本会自己退回 awk
 RUN apk add --no-cache curl jq ca-certificates tzdata \
