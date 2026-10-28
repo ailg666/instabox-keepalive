@@ -173,44 +173,50 @@ INSTABOX_API_KEY_2 = ibk_xxx      # 占死 2 号位；任务变成 1=aaa 2=xxx 3
 
 ## Docker 部署（NAS / 群晖 / 1Panel）
 
-宿主机不想装东西就丢进容器：镜像里装的就是这个仓库的 `keepalive.sh`。两种用法二选一：
+宿主机不想装东西就丢进容器。镜像发布在 Docker Hub（[ailg/instabox-keepalive](https://hub.docker.com/r/ailg/instabox-keepalive)，amd64/arm64，CI 自动更新），三种姿势按口味选：
 
-**方式一：直接拉现成镜像（免 clone 免 build）**——镜像由 CI 自动构建发布在 Docker Hub（`ailg/instabox-keepalive`），amd64/arm64 都有：
+**姿势一：docker compose（推荐）**——下载两个文件、填一个 key、一条命令起：
 
 ```sh
 mkdir -p instabox-keepalive && cd instabox-keepalive
-# 拉镜像（国内网络建议给 daemon 配好 docker.io 镜像加速，NAS 一般都自带）
-docker pull ailg/instabox-keepalive:latest
-# 下载 .env 模板填好 key
+curl -fsSLo docker-compose.yml https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/docker/docker-compose.yml
 curl -fsSLo .env https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/docker/.env.example
-chmod 600 .env && vi .env      # INSTABOX_API_KEY=ibk_xxx + INSTABOX_SNAPSHOT=1
-# 起容器（只读 + tmpfs，和 compose 版同款安全配置）
+chmod 600 .env && vi .env      # 只需填 INSTABOX_API_KEY=ibk_xxx；要快照就加 INSTABOX_SNAPSHOT=1
+docker compose up -d           # 自动拉镜像，不用 clone 不用 build
+docker compose logs -f         # 应看到 "watch: 快照轮换已开..."
+```
+
+**姿势二：docker run 一条命令（零文件）**——必填就一个 key，全部 `-e` 传进去，适合临时/极简场景：
+
+```sh
 docker run -d --name instabox-keepalive --restart unless-stopped \
-  --env-file .env --read-only --tmpfs /tmp --init \
+  -e INSTABOX_API_KEY=ibk_xxx \
+  -e INSTABOX_SNAPSHOT=1 \
+  --read-only --tmpfs /tmp --init \
   -e INSTABOX_SNAPSHOT_STATE=/tmp/instabox-snapshot-state \
   ailg/instabox-keepalive:latest
-docker logs -f instabox-keepalive   # 应看到 "watch: 快照轮换已开..."
-# 手动补一轮/看状态：
+docker logs -f instabox-keepalive
+```
+
+多账号 `-e INSTABOX_API_KEY=ibk_aaa,ibk_bbb`、其它变量（HOURS 等）同样 `-e` 追加即可，名字和 VPS 版完全一致。
+
+**姿势三：clone 本地构建**（改了代码 / 拉不动镜像时；构建源已换阿里云，不怕被墙）：
+
+```sh
+git clone https://github.com/ailg666/instabox-keepalive.git && cd instabox-keepalive/docker
+cp .env.example .env && chmod 600 .env   # 填 INSTABOX_API_KEY=ibk_xxx
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+三种姿势通用：
+
+```sh
+# 手动补一轮快照 / 看状态 / 一次性命令（姿势三也可用 docker compose run --rm ...）
 docker exec instabox-keepalive sh /opt/instabox-keepalive/keepalive.sh --snapshot
 docker exec instabox-keepalive sh /opt/instabox-keepalive/keepalive.sh --status
 ```
 
-**方式二：clone 本地构建**（要改代码、或拉不动镜像时；构建源已换阿里云，不怕被墙）：
-
-```sh
-cd docker
-cp .env.example .env && chmod 600 .env   # 填 INSTABOX_API_KEY=ibk_xxx
-docker compose up -d --build
-docker compose logs -f
-```
-
-变量名、多账号写法和 VPS 版完全一致，一份 `.env` 两边通用；`--status` / `--once` / `--release` 也能当一次性命令跑：
-
-```sh
-docker compose run --rm instabox-keepalive --status
-```
-
-> 镜像发布：每次 push main（改了 `keepalive.sh` / `docker/**`）CI 自动重建 `:latest`；打 `v*` tag 额外发版本号 tag（如 `v1.0.0` → `:1.0.0`），方便回滚。镜像地址：[hub.docker.com/r/ailg/instabox-keepalive](https://hub.docker.com/r/ailg/instabox-keepalive)
+> 镜像发布：每次 push main（改了 `keepalive.sh` / `docker/**`）CI 自动重建 `:latest`；打 `v*` tag 额外发版本号 tag（如 `v1.0.0` → `:1.0.0`），方便回滚。
 
 ## Cloudflare Worker 部署（附加方案）
 

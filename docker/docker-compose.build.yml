@@ -1,0 +1,9 @@
+# 本地构建用（改了 keepalive.sh 想直接验证）：
+#   cd docker
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# 构建源已换阿里云镜像，不怕被墙；构建产物会打上 ailg/instabox-keepalive:latest 的本地 tag
+services:
+  instabox-keepalive:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile

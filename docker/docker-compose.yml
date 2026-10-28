@@ -1,23 +1,16 @@
 services:
   instabox-keepalive:
-    # 现成镜像在 Docker Hub（CI 自动构建，amd64/arm64）：
-    # 改了本地代码就用 docker compose up -d --build 用本地构建覆盖
+    # 镜像在 Docker Hub（CI 自动构建，amd64/arm64），up -d 自动拉取，无需 clone 无需 build；
+    # 要本地构建改代码：docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
     image: ailg/instabox-keepalive:latest
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
     container_name: instabox-keepalive
     restart: unless-stopped
 
     # init 负责回收 sleep 子进程、转发信号，docker stop 才干净
     init: true
 
-    # key 只从 .env 读，不进命令行
+    # key 只从 .env 读，不进命令行（docker ps 里看不到）
     env_file: .env
-    # 不想用 env_file 也可以直接写 environment：
-    # environment:
-    #   INSTABOX_API_KEY: ibk_xxx
-    #   INSTABOX_MACHINE: all
 
     environment:
       # 冷启动唤醒实测偶尔超过默认的 3×5s=15s 窗口，放大到 6×5s=30s。
