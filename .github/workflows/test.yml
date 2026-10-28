@@ -47,7 +47,9 @@ jobs:
     steps:
       - name: 装依赖（alpine 容器）
         if: matrix.container != ''
-        run: apk add --no-cache curl python3 nodejs
+        # tzdata：busybox date 要靠它才认得 TZ=Asia/Shanghai，否则静默回退 UTC，快照到点判断会错位
+        # （本项目 Docker 镜像已自带 tzdata + TZ=Asia/Shanghai，见 docker/Dockerfile，生产不受影响）
+        run: apk add --no-cache curl python3 nodejs tzdata
 
       - uses: actions/checkout@v4
 
