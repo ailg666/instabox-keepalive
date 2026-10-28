@@ -40,6 +40,12 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/ibk-test.XXXXXX")
 MOCK_PID=""
 MOCK_PORT=""
 WK_SCEN="running"
+
+# _ymd <偏移天数> -> 按上海时区的 YYYYMMDD。不用 date -d：CI 的 alpine/busybox 不认 '-1 day'，
+# 也不直接用本地时区：CI runner 是 UTC，与被测逻辑的 Asia/Shanghai 在 16-24 点 UTC 段会差一天
+_ymd() {
+	python3 -c "import datetime;print((datetime.datetime.utcnow()+datetime.timedelta(hours=8,days=$1)).strftime('%Y%m%d'))"
+}
 cleanup() {
 	[ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null
 	rm -rf "$TMP"
@@ -183,8 +189,8 @@ test_shell() {
 
 	# 快照轮换：预置「昨 2 + 前 2/3/4 天各 1」共 5 个，跑一轮应删昨旧+前 4 天那两份、建 1 个新的
 	sec "keepalive.sh --snapshot（删 2 旧建 1 新）"
-	_d1=$(date -d '-1 day' +%Y%m%d); _d2=$(date -d '-2 day' +%Y%m%d)
-	_d3=$(date -d '-3 day' +%Y%m%d); _d4=$(date -d '-4 day' +%Y%m%d)
+	_d1=$(_ymd -1); _d2=$(_ymd -2)
+	_d3=$(_ymd -3); _d4=$(_ymd -4)
 	_preset="ka-${_d1}-0800-x1,ka-${_d1}-2000-x1,ka-${_d2}-0800-x1,ka-${_d3}-0800-x1,ka-${_d4}-0800-x1"
 	start_mock running "--ttl 900 --preset-snapshots $_preset" || return 0
 	_ka_env="INSTABOX_API_URL=http://127.0.0.1:$MOCK_PORT INSTABOX_API_KEY=ibk_testkey0001 INSTABOX_ENV_FILE=/dev/null"
@@ -289,8 +295,8 @@ test_worker() {
 	has "报没配账号" "没配账号" "$out"
 
 	# 快照轮换（预置同 shell 版：昨 2 + 前 2/3/4 天各 1）
-	_wd1=$(date -d '-1 day' +%Y%m%d); _wd2=$(date -d '-2 day' +%Y%m%d)
-	_wd3=$(date -d '-3 day' +%Y%m%d); _wd4=$(date -d '-4 day' +%Y%m%d)
+	_wd1=$(_ymd -1); _wd2=$(_ymd -2)
+	_wd3=$(_ymd -3); _wd4=$(_ymd -4)
 	_wpreset="ka-${_wd1}-0800-x1,ka-${_wd1}-2000-x1,ka-${_wd2}-0800-x1,ka-${_wd3}-0800-x1,ka-${_wd4}-0800-x1"
 
 	sec "worker.js /snapshots（列出预置的 5 个）"
