@@ -503,7 +503,7 @@ maybe_snapshot() { # 到了快照小时（按 SNAP_TZ）且这个小时没做成
 		*) return 0 ;;
 	esac
 	stamp=$(TZ=${SNAP_TZ:-Asia/Shanghai} date +%Y%m%d%H)
-	state=$(dirname "$ENV_FILE")/.snapshot-state
+	state=${INSTABOX_SNAPSHOT_STATE:-$(dirname "$ENV_FILE")/.snapshot-state}
 	if [ -f "$state" ] && [ "$(cat "$state" 2>/dev/null)" = "$stamp" ]; then
 		return 0
 	fi
