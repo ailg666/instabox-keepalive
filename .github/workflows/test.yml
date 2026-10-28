@@ -54,12 +54,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 跑回归（${{ matrix.label }}）
-        run: sh tools/run_tests.sh all
+        run: |
+          sh tools/run_tests.sh all > /tmp/test.out 2>&1; rc=$?
+          cat /tmp/test.out
+          exit $rc
+
+      - name: 失败摘要进 annotations（免登录也能从 API 读到挂点）
+        if: failure()
+        run: |
+          sed 's/\x1b\[[0-9;]*m//g' /tmp/test.out | grep -E 'FAIL|期望包含|实际|错误' | head -12 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit 0
 
   revert:
-    # 只在 main 分支 push 挂掉时回退；PR 挂了什么都不做
+    # 已禁用（if 恒 false）：个人仓库 CI 红了自动 git revert 太激进，曾把正常功能连环回退。
+    # 要重新启用把下面的 if 改回 `failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'`
     needs: test
-    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
