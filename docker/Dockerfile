@@ -24,3 +24,4 @@ WORKDIR /opt/instabox-keepalive
 
 ENTRYPOINT ["/bin/sh", "/opt/instabox-keepalive/keepalive.sh"]
 CMD ["--watch"]
+# 测试自动构建 Wed, Oct 28, 2026  9:28:17 PM
