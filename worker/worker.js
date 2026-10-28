@@ -489,16 +489,18 @@ function maskKey(key) {
 
 // ---- 快照轮换 -----------------------------------------------------------------
 // 时区感知的当前时间：{ ymd:"20261027", hour:20, minute:5 }；时区名不合法时 hour=-1
-// （时间窗判定永远不命中，退化为只能手动 /snapshot）
+// （时间窗判定永远不命中，退化为只能手动 /snapshot）。
+// 用 formatToParts 取字段值而不是 format() 的输出串：后者依赖 locale 格式，
+// 在 small-icu 的 Node（如 alpine 的 musl 版）上 en-CA 会回退 en-US 变成 10/28/2026
 function zonedParts(tz, at = Date.now()) {
   try {
-    const ymd = new Intl.DateTimeFormat("en-CA", {
+    const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
-    }).format(at).split("-").join("");
-    const [h, m] = new Intl.DateTimeFormat("en-GB", {
-      timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-    }).format(at).split(":");
-    return { ymd, hour: Number(h) % 24, minute: Number(m) };
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(at);
+    const get = (t) => parts.find((p) => p.type === t)?.value ?? "";
+    const ymd = `${get("year")}${get("month")}${get("day")}`;
+    return { ymd, hour: Number(get("hour")) % 24, minute: Number(get("minute")) };
   } catch {
     return { ymd: "", hour: -1, minute: -1 };
   }
