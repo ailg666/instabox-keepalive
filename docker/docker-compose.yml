@@ -1,12 +1,11 @@
 services:
   instabox-keepalive:
-    # 现成镜像在 ghcr（自动构建）：docker compose pull && docker compose up -d 免 build；
+    # 现成镜像在 Docker Hub（CI 自动构建，amd64/arm64）：
     # 改了本地代码就用 docker compose up -d --build 用本地构建覆盖
-    image: ghcr.io/ailg666/instabox-keepalive:latest
+    image: ailg/instabox-keepalive:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: instabox-keepalive:latest
     container_name: instabox-keepalive
     restart: unless-stopped
 

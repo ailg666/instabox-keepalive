@@ -175,12 +175,12 @@ INSTABOX_API_KEY_2 = ibk_xxx      # 占死 2 号位；任务变成 1=aaa 2=xxx 3
 
 宿主机不想装东西就丢进容器：镜像里装的就是这个仓库的 `keepalive.sh`。两种用法二选一：
 
-**方式一：直接拉现成镜像（免 clone 免 build）**——镜像由 CI 自动构建发布在 ghcr，amd64/arm64 都有：
+**方式一：直接拉现成镜像（免 clone 免 build）**——镜像由 CI 自动构建发布在 Docker Hub（`ailg/instabox-keepalive`），amd64/arm64 都有：
 
 ```sh
 mkdir -p instabox-keepalive && cd instabox-keepalive
-# 拉镜像（国内拉 ghcr 慢的话见下面方式二）
-docker pull ghcr.io/ailg666/instabox-keepalive:latest
+# 拉镜像（国内网络建议给 daemon 配好 docker.io 镜像加速，NAS 一般都自带）
+docker pull ailg/instabox-keepalive:latest
 # 下载 .env 模板填好 key
 curl -fsSLo .env https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/docker/.env.example
 chmod 600 .env && vi .env      # INSTABOX_API_KEY=ibk_xxx + INSTABOX_SNAPSHOT=1
@@ -188,14 +188,14 @@ chmod 600 .env && vi .env      # INSTABOX_API_KEY=ibk_xxx + INSTABOX_SNAPSHOT=1
 docker run -d --name instabox-keepalive --restart unless-stopped \
   --env-file .env --read-only --tmpfs /tmp --init \
   -e INSTABOX_SNAPSHOT_STATE=/tmp/instabox-snapshot-state \
-  ghcr.io/ailg666/instabox-keepalive:latest
+  ailg/instabox-keepalive:latest
 docker logs -f instabox-keepalive   # 应看到 "watch: 快照轮换已开..."
 # 手动补一轮/看状态：
 docker exec instabox-keepalive sh /opt/instabox-keepalive/keepalive.sh --snapshot
 docker exec instabox-keepalive sh /opt/instabox-keepalive/keepalive.sh --status
 ```
 
-**方式二：clone 本地构建**（要改代码、或国内拉 ghcr 太慢时；构建源已换阿里云镜像，不怕被墙）：
+**方式二：clone 本地构建**（要改代码、或拉不动镜像时；构建源已换阿里云，不怕被墙）：
 
 ```sh
 cd docker
@@ -210,7 +210,7 @@ docker compose logs -f
 docker compose run --rm instabox-keepalive --status
 ```
 
-> 镜像发布：每次 push main（改了 `keepalive.sh` / `docker/**`）CI 自动重建 `:latest`；打 `v*` tag 额外发版本号 tag（如 `v1.0.0` → `:1.0.0`），方便回滚。
+> 镜像发布：每次 push main（改了 `keepalive.sh` / `docker/**`）CI 自动重建 `:latest`；打 `v*` tag 额外发版本号 tag（如 `v1.0.0` → `:1.0.0`），方便回滚。镜像地址：[hub.docker.com/r/ailg/instabox-keepalive](https://hub.docker.com/r/ailg/instabox-keepalive)
 
 ## Cloudflare Worker 部署（附加方案）
 
