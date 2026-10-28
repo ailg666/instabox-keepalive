@@ -1,0 +1,63 @@
+name: docker
+
+# 自动构建并发布镜像到 ghcr.io/ailg666/instabox-keepalive：
+#   push main（改了 keepalive.sh / docker/**）→ 更新 :latest 和 :main-<sha>
+#   打 v* tag（如 v1.0.0）→ 额外发一个 :1.0.0 版本 tag
+# 平台：linux/amd64 + linux/arm64（NAS 常见架构，qemu 跨平台构建）。
+# 用仓库自带的 GITHUB_TOKEN 推 ghcr，零额外密钥；首次发布后需到
+# GitHub → Packages → 本包 → Settings 把可见性改成 Public，别人才拉得到。
+on:
+  push:
+    branches: [main]
+    paths: [keepalive.sh, docker/**, .github/workflows/docker.yml]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备多架构构建（qemu + buildx）
+        uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=main-
+            type=semver,pattern={{version}}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
