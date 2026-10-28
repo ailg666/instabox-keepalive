@@ -4,7 +4,7 @@
 # 一个文件搞定安装 / 续租 / 卸载，纯 POSIX sh（Alpine/BusyBox、Debian、OpenWrt），只依赖 curl。
 #
 #   安装（key 只写进本机 0600 的 .env，绝不落仓库、不进进程列表）
-#     key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+#     key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh)
 #     machine=qqq 只保一台；machine= 留空 / all = 保活这把 key 名下全部机器
 #
 #   卸载
@@ -48,7 +48,7 @@
 # 机器被挂起后机器内部的定时器也会冻结，所以续租必须从机器外面打进来。
 set -u
 
-RAW=${RAW_BASE:-https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main}
+RAW=${RAW_BASE:-https://raw.githubusercontent.com/ailg666/instabox-keepalive/main}
 DEF_DIR=${INSTALL_DIR:-/root/instabox-keepalive}
 DIR=$DEF_DIR
 SERVICE=${SERVICE_NAME:-instabox-keepalive}
