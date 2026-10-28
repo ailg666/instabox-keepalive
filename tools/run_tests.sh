@@ -330,4 +330,14 @@ test_worker() {
 	WK_SCEN=running
 }
 
-[ "$SEL" = "all" ] || [ "$SEL" = "shell" ] && test_she
+[ "$SEL" = "all" ] || [ "$SEL" = "shell" ] && test_shell
+[ "$SEL" = "all" ] || [ "$SEL" = "worker" ] && test_worker
+
+stop_mock
+printf '\n----------------------------------------\n'
+printf '通过 %s  失败 %s\n' "$PASS" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+	printf '失败项:%s\n' "$FAILED"
+	exit 1
+fi
+exit 0
