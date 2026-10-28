@@ -456,9 +456,12 @@ prune_snaps() { # 每把 key：列 ka- 快照 → 算删除名单 → 删（创�
 snap_create_one() { # snap_create_one <id> <label>
 	tail6=$(printf '%s' "$1" | tr -cd 'a-z0-9' | tail -c 6)
 	sname="ka-$(TZ=${SNAP_TZ:-Asia/Shanghai} date +%Y%m%d-%H%M)-$tail6"
-	HTTP_IDEM="ka-snap-$1-$$-$(date +%s)"
-	HTTP_EXTRA_OK="201 202"
-	if http POST "/v1/machines/$1/snapshots" "{\"name\":\"$sname\"}"; then
+	snap_post() { # snap_post <id> <重试标记>：POST 一次建快照
+		HTTP_IDEM="ka-snap-$1-$$-$(date +%s)${2:-}"
+		HTTP_EXTRA_OK="201 202"
+		http POST "/v1/machines/$1/snapshots" "{\"name\":\"$sname\"}"
+	}
+	if snap_post "$1"; then
 		log "快照 ok $2 → $sname"
 		return 0
 	fi
@@ -466,14 +469,18 @@ snap_create_one() { # snap_create_one <id> <label>
 		log "快照已存在 $sname（本轮做过了，当成功）"
 		return 0
 	fi
-	if [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "409" ]; then
-		if del_oldest_kasnap; then
-			HTTP_IDEM="ka-snap-$1-$$-$(date +%s)r"
-			HTTP_EXTRA_OK="201 202"
-			if http POST "/v1/machines/$1/snapshots" "{\"name\":\"$sname\"}"; then
-				log "快照 ok（腾位后）$2 → $sname"
-				return 0
-			fi
+	# 机器被挂起（suspended 不能快照，要 running 或 stopped）：像续租一样先唤醒再重试
+	if [ "$AUTO_RESUME" = "1" ] && is_not_running; then
+		if wake_one "$1" "$2" && snap_post "$1" r; then
+			log "快照 ok（唤醒后）$2 → $sname"
+			return 0
+		fi
+	fi
+	# 只有额度/存储池被拒才腾位重试；机器状态冲突不在这类（上面已处理，别在这自删快照）
+	if { [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "409" ]; } && ! is_not_running; then
+		if del_oldest_kasnap && snap_post "$1" r2; then
+			log "快照 ok（腾位后）$2 → $sname"
+			return 0
 		fi
 	fi
 	log "快照失败 $2 HTTP $HTTP_CODE: $HTTP_BODY"

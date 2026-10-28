@@ -227,6 +227,13 @@ test_shell() {
 	has "到点建快照" "快照 ok" "$out"
 	has "碰到了建快照接口" "POST /v1/machines/m_test/snapshots 202" "$(reqlog)"
 
+	sec "keepalive.sh --snapshot（suspended → 自动唤醒再快照）"
+	out=$(run_ka suspended --snapshot)
+	has "唤醒后快照成功" "快照 ok（唤醒后）" "$out"
+	log=$(reqlog)
+	has "先打过 POST /resume" "POST /v1/machines/m_test/resume 202" "$log"
+	has "唤醒后建了快照" "POST /v1/machines/m_test/snapshots 202" "$log"
+
 	sec "keepalive.sh --once（不开快照就绝不碰快照接口）"
 	start_mock running "--ttl 900 --preset-snapshots $_preset" || return 0
 	out=$(env -i PATH="$PATH" INSTABOX_API_URL="http://127.0.0.1:$MOCK_PORT" INSTABOX_API_KEY=ibk_testkey0001 INSTABOX_ENV_FILE=/dev/null sh "$REPO/keepalive.sh" --once 2>&1)
@@ -314,16 +321,13 @@ test_worker() {
 	has "删昨旧建 1 留 4" "快照 +1 -1 留4 ok" "$out"
 	has "列出新建的名字" "+ ka-" "$out"
 	WK_MOCK_ARGS=""
+
+	sec "worker.js /snapshot（suspended → 自动唤醒再快照）"
+	WK_SCEN=suspended
+	out=$(run_wk /snapshot INSTABOX_API_KEY=ibk_testkey0001)
+	has "唤醒后快照成功" "唤醒后成功" "$out"
+	has "轮换 200" "STATUS 200" "$out"
+	WK_SCEN=running
 }
 
-[ "$SEL" = "all" ] || [ "$SEL" = "shell" ] && test_shell
-[ "$SEL" = "all" ] || [ "$SEL" = "worker" ] && test_worker
-
-stop_mock
-printf '\n----------------------------------------\n'
-printf '通过 %s  失败 %s\n' "$PASS" "$FAIL"
-if [ "$FAIL" -gt 0 ]; then
-	printf '失败项:%s\n' "$FAILED"
-	exit 1
-fi
-exit 0
+[ "$SEL" = "all" ] || [ "$SEL" = "shell" ] && test_she

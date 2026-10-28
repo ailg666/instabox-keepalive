@@ -167,6 +167,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.endswith("/snapshots"):
             body = self._body()
+            # suspended（冻结态）的机器不能快照：真实 API 回 409 要求先 resume/stop
+            if current_state() == "suspended":
+                note(f"POST {path} 409")
+                return self._send(409, {"error": {"code": "operation_conflict", "message": "machine is suspended; stop it first (only a stopped machine can be used to save a snapshot)"}})
             name = (body.get("name") or "").strip()
             if not name:
                 note(f"POST {path} 400")

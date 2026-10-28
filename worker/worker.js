@@ -309,8 +309,8 @@ async function stateOf(c, id) {
   return r.ok ? r.json?.state || "" : "";
 }
 
-// 挂了就先唤醒再续租：resume 优先，stopped 的用 start 兜底；running 后立刻续租一次
-async function wakeThenLease(c, m) {
+// 唤醒一台机器：resume 优先，stopped 的用 start 兜底，轮询到 running 返回 wake 记录；没起来返回 null
+async function wakeMachine(c, m) {
   const wake = [];
   for (const type of ["resume", "start"]) {
     const a = await act(c, m.id, type);
@@ -319,14 +319,21 @@ async function wakeThenLease(c, m) {
   }
   for (let i = 0; i < 3; i++) {
     await sleep(5000);
-    if ((await stateOf(c, m.id)) === "running") {
-      const r = await lease(c, m.id);
-      return r.ok
-        ? { ok: true, resumed: true, expiresAt: r.json?.expiresAt, wake }
-        : { ok: false, resumed: true, status: r.status, error: r.text.slice(0, 200), wake };
-    }
+    if ((await stateOf(c, m.id)) === "running") return wake;
   }
-  return { ok: false, resumed: true, status: 409, error: "已发唤醒，机器还没 running（下一轮再续）", wake };
+  return null;
+}
+
+// 挂了就先唤醒再续租：running 后立刻续租一次
+async function wakeThenLease(c, m) {
+  const wake = await wakeMachine(c, m);
+  if (wake === null) {
+    return { ok: false, resumed: true, status: 409, error: "已发唤醒，机器还没 running（下一轮再续）", wake: [] };
+  }
+  const r = await lease(c, m.id);
+  return r.ok
+    ? { ok: true, resumed: true, expiresAt: r.json?.expiresAt, wake }
+    : { ok: false, resumed: true, status: r.status, error: r.text.slice(0, 200), wake };
 }
 
 const noMachine = (acc) =>
@@ -538,13 +545,24 @@ async function snapshotOne(acc, m) {
   const hh = String(p.hour).padStart(2, "0");
   const mm = String(p.minute).padStart(2, "0");
   const name = `ka-${p.ymd}-${hh}${mm}-${m.id.replace(/^m_/, "").slice(-6)}`;
-  const idem = `ka-snap-${m.id}-${Date.now()}`;
-  let r = await call(acc, "POST", `/v1/machines/${m.id}/snapshots`, { name }, idem);
+  const post = (suffix = "") =>
+    call(acc, "POST", `/v1/machines/${m.id}/snapshots`, { name }, `ka-snap-${m.id}-${Date.now()}${suffix}`);
+  let r = await post();
   if (r.ok) return { ok: true, name, status: r.status };
   if (r.status === 409 && /taken|exists|duplicate/i.test(r.text || "")) {
     return { ok: true, name, status: r.status, note: "同名快照已存在" };
   }
-  if (r.status === 429 || r.status === 409) {
+  // suspended/stopped 的机器不能快照（平台只收 running/stopped，冻结态一律 409）：
+  // 像续租一样先唤醒再重试
+  if (acc.autoResume && isNotRunning(r)) {
+    const wake = await wakeMachine(acc, m);
+    if (wake !== null) {
+      r = await post("-r");
+      if (r.ok) return { ok: true, name, status: r.status, note: "唤醒后成功", wake };
+    }
+  }
+  // 只有额度/存储池被拒才腾位重试；机器状态冲突不在这类（上面已处理，别在这自删快照）
+  if ((r.status === 429 || r.status === 409) && !isNotRunning(r)) {
     const list = await call(acc, "GET", "/v1/snapshots");
     if (list.ok) {
       const kas = (list.json?.snapshots || [])
@@ -552,7 +570,7 @@ async function snapshotOne(acc, m) {
         .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
       if (kas.length) {
         await call(acc, "DELETE", `/v1/snapshots/${kas[0].id}`, null, `ka-del-${kas[0].id}-${Date.now()}`);
-        r = await call(acc, "POST", `/v1/machines/${m.id}/snapshots`, { name }, `${idem}-r`);
+        r = await post("-r2");
         if (r.ok) return { ok: true, name, status: r.status, note: "腾位后成功" };
       }
     }
