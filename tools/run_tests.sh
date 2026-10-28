@@ -98,11 +98,12 @@ run_ka() {
 		sh "$REPO/keepalive.sh" "$@" 2>&1
 }
 
-# run_wk <path> [额外 env...] —— 起假 API 后跑 worker.js 的 fetch handler
+# run_wk <path> [额外 env...] —— 起假 API 后跑 worker.js 的 fetch handler；
+# WK_MOCK_ARGS 会作为额外参数传给 mock（如 "--preset-snapshots ka-...")
 run_wk() {
 	wpath=$1
 	shift
-	start_mock "${WK_SCEN:-running}" || return 1
+	start_mock "${WK_SCEN:-running}" "${WK_MOCK_ARGS:-}" || return 1
 	env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
 		INSTABOX_API_URL="http://127.0.0.1:$MOCK_PORT" \
 		"$@" node "$HERE/worker_harness.mjs" "$wpath" 2>&1
@@ -179,6 +180,52 @@ test_shell() {
 	out=$(env -i PATH="$PATH" INSTABOX_API_KEY=ibk_x INSTABOX_ENV_FILE=/dev/null INSTABOX_LEASE_TTL=5 \
 		sh "$REPO/keepalive.sh" --once 2>&1)
 	has "TTL 越界报错" "TTL 必须在 30-3600" "$out"
+
+	# 快照轮换：预置「昨 2 + 前 2/3/4 天各 1」共 5 个，跑一轮应删昨旧+前 4 天那两份、建 1 个新的
+	sec "keepalive.sh --snapshot（删 2 旧建 1 新）"
+	_d1=$(date -d '-1 day' +%Y%m%d); _d2=$(date -d '-2 day' +%Y%m%d)
+	_d3=$(date -d '-3 day' +%Y%m%d); _d4=$(date -d '-4 day' +%Y%m%d)
+	_preset="ka-${_d1}-0800-x1,ka-${_d1}-2000-x1,ka-${_d2}-0800-x1,ka-${_d3}-0800-x1,ka-${_d4}-0800-x1"
+	start_mock running "--ttl 900 --preset-snapshots $_preset" || return 0
+	_ka_env="INSTABOX_API_URL=http://127.0.0.1:$MOCK_PORT INSTABOX_API_KEY=ibk_testkey0001 INSTABOX_ENV_FILE=/dev/null"
+	out=$(env -i PATH="$PATH" $_ka_env sh "$REPO/keepalive.sh" --snapshot 2>&1)
+	has "建新快照" "快照 ok" "$out"
+	has "删昨天较老那份" "删旧快照 ka-${_d1}-0800-x1" "$out"
+	nhas "不该删 4 天前那份（它留着当第 5 个）" "删旧快照 ka-${_d4}-0800-x1" "$out"
+	log=$(reqlog)
+	has "打过建快照接口" "POST /v1/machines/m_test/snapshots 202" "$log"
+	[ "$(printf '%s' "$log" | grep -c 'DELETE /v1/snapshots/.* 204')" = "1" ] \
+		&& ok "恰好删 1 个（昨旧腾位）" || bad "恰好删 1 个（昨旧腾位）" "$log"
+
+	sec "keepalive.sh --snapshot（重跑：幂等/腾位都算对）"
+	out=$(env -i PATH="$PATH" $_ka_env sh "$REPO/keepalive.sh" --snapshot 2>&1)
+	case "$out" in
+		*"快照已存在"*) ok "同分钟重跑 = 幂等（快照已存在）" ;;
+		*"快照 ok"*) ok "跨分钟重跑 = 删最老腾位后建新（快照 ok）" ;;
+		*) bad "重跑应成功" "$(printf '%s' "$out" | tr '\n' '|' | cut -c1-300)" ;;
+	esac
+	has "这轮腾位删的是 4 天前那份" "删旧快照 ka-${_d4}-0800-x1" "$out"
+	log=$(reqlog)
+	[ "$(printf '%s' "$log" | grep -c 'DELETE /v1/snapshots/.* 204')" = "2" ] \
+		&& ok "累计删 2 个" || bad "累计删 2 个" "$log"
+
+	sec "keepalive.sh --snapshot-auto（不到点零请求，到点做一轮）"
+	start_mock running "--ttl 900" || return 0
+	_sa_env="INSTABOX_API_URL=http://127.0.0.1:$MOCK_PORT INSTABOX_API_KEY=ibk_testkey0001 INSTABOX_ENV_FILE=/dev/null INSTABOX_SNAPSHOT=1"
+	# 小时按 SNAP_TZ 取（不依赖测试机本地时区）：当前小时 = 到点；+12h = 不到点
+	_cur_h=$(TZ=Asia/Shanghai date +%H | sed 's/^0*\([0-9]\)/\1/')
+	_other_h=$(( (_cur_h + 12) % 24 ))
+	out=$(env -i PATH="$PATH" $_sa_env INSTABOX_SNAPSHOT_HOURS="$_other_h" sh "$REPO/keepalive.sh" --snapshot-auto 2>&1)
+	nhas "不到点不该碰快照接口" "/v1/snapshots" "$(reqlog)"
+	out=$(env -i PATH="$PATH" $_sa_env INSTABOX_SNAPSHOT_HOURS="$_cur_h" sh "$REPO/keepalive.sh" --snapshot-auto 2>&1)
+	has "到点建快照" "快照 ok" "$out"
+	has "碰到了建快照接口" "POST /v1/machines/m_test/snapshots 202" "$(reqlog)"
+
+	sec "keepalive.sh --once（不开快照就绝不碰快照接口）"
+	start_mock running "--ttl 900 --preset-snapshots $_preset" || return 0
+	out=$(env -i PATH="$PATH" INSTABOX_API_URL="http://127.0.0.1:$MOCK_PORT" INSTABOX_API_KEY=ibk_testkey0001 INSTABOX_ENV_FILE=/dev/null sh "$REPO/keepalive.sh" --once 2>&1)
+	has "续租正常" "续租 ok" "$out"
+	nhas "不该碰快照接口" "/snapshots" "$(reqlog)"
 }
 
 # ----------------------------------------------------------------- worker
@@ -240,6 +287,27 @@ test_worker() {
 	WK_SCEN=running
 	out=$(run_wk /)
 	has "报没配账号" "没配账号" "$out"
+
+	# 快照轮换（预置同 shell 版：昨 2 + 前 2/3/4 天各 1）
+	_wd1=$(date -d '-1 day' +%Y%m%d); _wd2=$(date -d '-2 day' +%Y%m%d)
+	_wd3=$(date -d '-3 day' +%Y%m%d); _wd4=$(date -d '-4 day' +%Y%m%d)
+	_wpreset="ka-${_wd1}-0800-x1,ka-${_wd1}-2000-x1,ka-${_wd2}-0800-x1,ka-${_wd3}-0800-x1,ka-${_wd4}-0800-x1"
+
+	sec "worker.js /snapshots（列出预置的 5 个）"
+	WK_SCEN=running; WK_MOCK_ARGS="--preset-snapshots $_wpreset"
+	out=$(run_wk "/snapshots?format=text" INSTABOX_API_KEY=ibk_testkey0001)
+	has "列表 200" "STATUS 200" "$out"
+	has "数出 5 个" "5 个快照" "$out"
+	has "标出轮换快照" "(轮换)" "$out"
+	WK_MOCK_ARGS=""
+
+	sec "worker.js /snapshot（手动轮换：删昨旧建 1 留 4，开关未开也执行）"
+	WK_SCEN=running; WK_MOCK_ARGS="--preset-snapshots $_wpreset"
+	out=$(run_wk "/snapshot?format=text" INSTABOX_API_KEY=ibk_testkey0001)
+	has "轮换 200" "STATUS 200" "$out"
+	has "删昨旧建 1 留 4" "快照 +1 -1 留4 ok" "$out"
+	has "列出新建的名字" "+ ka-" "$out"
+	WK_MOCK_ARGS=""
 }
 
 [ "$SEL" = "all" ] || [ "$SEL" = "shell" ] && test_shell

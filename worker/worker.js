@@ -17,6 +17,8 @@
 //   GET /accounts             当前认到了哪些账号（key 打码）
 //   GET /log                  最近 48 条保活日志（需要 KV 绑定 LOG）
 //   GET /release              放掉租约
+//   GET /snapshot             立即做一轮快照轮换（手动触发，不受时间窗限制）
+//   GET /snapshots            列出各账号的快照（ka- 前缀的是轮换自动建的）
 // 都要带 ?token=...（设了 TOKEN 变量时）；可加 &format=text 看纯文本；
 // 加 &account=2 只操作 2 号账号（编号见 /accounts）。
 //
@@ -28,9 +30,17 @@
 // 机器被平台挂起（suspended）或停掉时，续租会 409 machine_not_running —— 此时光续租没用，
 // 得先唤醒：自动 POST /resume（stopped 的用 /start 兜底）→ 等 running → 再续租。
 // INSTABOX_AUTO_RESUME=0 可以关掉这个自愈。
+//
+// 快照轮换（INSTABOX_SNAPSHOT=1 开启，默认关）：cron 到了 INSTABOX_SNAPSHOT_HOURS
+// （默认 1,13，按 INSTABOX_TZ 时区，默认 Asia/Shanghai）的小时点就做一轮：对每台机器
+// 建 ka-YYYYMMDD-HHMM-<机器id后6位> 快照，并按「当天留 2、前 3 天各留 1」的 GFS 策略
+// 裁剪 ka- 前缀旧快照（其它前缀的快照永不碰）；删到 ≤ 额度-1 再建，免费版 5 个也够。
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 300;
+const SNAP_HOURS_DEFAULT = "1,13";
+const TZ_DEFAULT = "Asia/Shanghai";
+const SNAP_MAX_DEFAULT = 5;
 
 function clampTtl(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
@@ -42,6 +52,27 @@ function parseAutoResume(value, fallback) {
   return !["0", "false", "off", "no"].includes(String(value).trim().toLowerCase());
 }
 
+// "1"/"true"/"on" → true，“0”/“false”/“off” → false，没给用默认
+function parseOnOff(value, fallback) {
+  if (value === undefined || String(value).trim() === "") return fallback;
+  return !["0", "false", "off", "no"].includes(String(value).trim().toLowerCase());
+}
+
+// "1,13" / "01, 13" → Set{1,13}
+function parseHours(value) {
+  const out = new Set();
+  for (const part of String(value ?? "").split(",")) {
+    const n = Number.parseInt(part.trim(), 10);
+    if (Number.isInteger(n) && n >= 0 && n <= 23) out.add(n);
+  }
+  return out.size ? out : new Set([1, 13]);
+}
+
+function parseSnapMax(value) {
+  const n = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(n) && n >= 1 && n <= 50 ? n : SNAP_MAX_DEFAULT;
+}
+
 function cfg(env) {
   const base = {
     api: (env.INSTABOX_API_URL || API_DEFAULT).replace(/\/+$/, ""),
@@ -50,8 +81,14 @@ function cfg(env) {
     kv: env.LOG || null,
     // 被平台挂起后光续租没用，默认自愈：409 machine_not_running → resume/start → 再续租
     autoResume: parseAutoResume(env.INSTABOX_AUTO_RESUME ?? "1", true),
+    // 快照轮换默认关；INSTABOX_SNAPSHOT=1（或某账号 INSTABOX_SNAPSHOT_2=1）打开
+    snapshot: parseOnOff(env.INSTABOX_SNAPSHOT, false),
     // hourly（默认）：同一小时的“成功”不重复写 KV，省额度；every：每次都写；off：不写
     logMode: (env.INSTABOX_LOG_MODE || "hourly").trim(),
+    // 快照轮换：默认关；开了以后到点自动建 ka- 快照并按 GFS 策略裁剪
+    snapHours: parseHours(env.INSTABOX_SNAPSHOT_HOURS || SNAP_HOURS_DEFAULT),
+    tz: (env.INSTABOX_TZ || TZ_DEFAULT).trim(),
+    snapMax: parseSnapMax(env.INSTABOX_SNAPSHOT_MAX),
   };
   return { ...base, accounts: accountsOf(env, base) };
 }
@@ -145,6 +182,9 @@ function accountsOf(env, base) {
       lease: setting(env, "LEASE", n) || base.lease,
       ttl: clampTtl(setting(env, "LEASE_TTL", n), base.ttl),
       autoResume: parseAutoResume(setting(env, "AUTO_RESUME", n), base.autoResume),
+      snapshot: parseOnOff(setting(env, "SNAPSHOT", n), base.snapshot),
+      snapMax: base.snapMax,
+      tz: base.tz,
       api: base.api,
     });
   }
@@ -173,12 +213,13 @@ function resolve(c, name) {
   return { picked };
 }
 
-async function call(c, method, path, body) {
+async function call(c, method, path, body, idem) {
   const res = await fetch(c.api + path, {
     method,
     headers: {
       "X-API-Key": c.key,
       ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(idem ? { "Idempotency-Key": idem } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -446,6 +487,169 @@ function maskKey(key) {
   return key.length <= 8 ? "****" : `${key.slice(0, 4)}…${key.slice(-4)}`;
 }
 
+// ---- 快照轮换 -----------------------------------------------------------------
+// 时区感知的当前时间：{ ymd:"20261027", hour:20, minute:5 }；时区名不合法时 hour=-1
+// （时间窗判定永远不命中，退化为只能手动 /snapshot）
+function zonedParts(tz, at = Date.now()) {
+  try {
+    const ymd = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(at).split("-").join("");
+    const [h, m] = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).format(at).split(":");
+    return { ymd, hour: Number(h) % 24, minute: Number(m) };
+  } catch {
+    return { ymd: "", hour: -1, minute: -1 };
+  }
+}
+
+// "ka-20261027-0800-x1" → "20261027"；排序键就是整个名字（格式固定，字典序=时间序）
+const snapYmd = (name) => name.slice(3, 11);
+
+// GFS 裁剪：保留「今天≤2（即将建的是第 2 个，所以现有只留 1）+ 前 3 天各留最新 1 个」，
+// 其余全删（含 ≤4 天前的和组内旧的）；删完若仍 ≥ 额度（keepMax）再从最老的删到
+// keepMax-1 个，给新建的腾位。日期段不是 8 位数字的 ka- 视为残留，一并清理。
+function planSnapshotPrune(items, dates, keepMax) {
+  const inGroup = (d) => dates.includes(d);
+  const sorted = [...items].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const latest = new Map(); // ymd → 组内最新
+  for (const it of sorted) {
+    const d = snapYmd(it.name || "");
+    if (/^\d{8}$/.test(d) && inGroup(d)) latest.set(d, it);
+  }
+  const del = [];
+  const keep = [];
+  for (const it of sorted) {
+    const d = snapYmd(it.name || "");
+    ( /^\d{8}$/.test(d) && inGroup(d) && latest.get(d) === it ) ? keep.push(it) : del.push(it);
+  }
+  const extra = keep.length > keepMax - 1 ? keep.slice(0, keep.length - (keepMax - 1)) : [];
+  return { del: [...del, ...extra].map((s) => s.id), kept: keep.length - extra.length };
+}
+
+// 一台机器建一个 ka-YYYYMMDD-HHMM-<机器id后6位>；同名已存在当成功（幂等），
+// 额度被拒（429/409）就删最老的 ka- 腾位重试一次
+async function snapshotOne(acc, m) {
+  const p = zonedParts(acc.tz);
+  if (!p.ymd) return { ok: false, error: `时区 ${acc.tz} 不合法` };
+  const hh = String(p.hour).padStart(2, "0");
+  const mm = String(p.minute).padStart(2, "0");
+  const name = `ka-${p.ymd}-${hh}${mm}-${m.id.replace(/^m_/, "").slice(-6)}`;
+  const idem = `ka-snap-${m.id}-${Date.now()}`;
+  let r = await call(acc, "POST", `/v1/machines/${m.id}/snapshots`, { name }, idem);
+  if (r.ok) return { ok: true, name, status: r.status };
+  if (r.status === 409 && /taken|exists|duplicate/i.test(r.text || "")) {
+    return { ok: true, name, status: r.status, note: "同名快照已存在" };
+  }
+  if (r.status === 429 || r.status === 409) {
+    const list = await call(acc, "GET", "/v1/snapshots");
+    if (list.ok) {
+      const kas = (list.json?.snapshots || [])
+        .filter((s) => /^ka-/.test(s.name || ""))
+        .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+      if (kas.length) {
+        await call(acc, "DELETE", `/v1/snapshots/${kas[0].id}`, null, `ka-del-${kas[0].id}-${Date.now()}`);
+        r = await call(acc, "POST", `/v1/machines/${m.id}/snapshots`, { name }, `${idem}-r`);
+        if (r.ok) return { ok: true, name, status: r.status, note: "腾位后成功" };
+      }
+    }
+  }
+  return { ok: false, name, status: r.status, error: (r.text || "").slice(0, 160) };
+}
+
+// 一个账号一轮：裁剪旧 ka- 快照 → 对每台选中机器建新的
+async function snapshotAccount(acc) {
+  const out = { account: acc.account, ok: false, created: [], deleted: [], kept: 0 };
+  const { list, missing, error } = await machines(acc);
+  if (error || !list.length) {
+    out.error = error || noMachine(acc);
+    return out;
+  }
+  const r = await call(acc, "GET", "/v1/snapshots");
+  if (!r.ok) {
+    out.error = `列快照失败：HTTP ${r.status} ${(r.text || "").slice(0, 160)}`;
+    return out;
+  }
+  const kas = (r.json?.snapshots || []).filter((s) => /^ka-/.test(s.name || ""));
+  // 窗口 5 组：今天(建前只留 1，新的算第 2 个) + 前 4 天各留最新 1；
+  // 窗口外/组内旧的删；删完仍 ≥ 额度的再从最老删到额度-1 腾位 ——
+  // 早上那轮删的是「昨天 2 份中较旧的」，晚上那轮删的是「4 天前最老那份」。
+  const dates = [0, 1, 2, 3, 4].map((n) => zonedParts(acc.tz, Date.now() - n * 86400000).ymd);
+  const plan = planSnapshotPrune(kas, dates, acc.snapMax);
+  for (const id of plan.del) {
+    const d = await call(acc, "DELETE", `/v1/snapshots/${id}`, null, `ka-del-${id}-${Date.now()}`);
+    if (d.ok || d.status === 404) out.deleted.push(id);
+  }
+  out.kept = plan.kept;
+  const results = [];
+  for (const m of list) results.push({ machine: m.name, ...(await snapshotOne(acc, m)) });
+  out.machines = results;
+  out.created = results.filter((x) => x.ok).map((x) => x.name);
+  out.ok = results.every((x) => x.ok) && !missing.length;
+  if (missing.length) out.error = `找不到机器 ${missing.join("、")}`;
+  return out;
+}
+
+// 快照轮换（scheduled 到点或手动 /snapshot 都走这里）；ignoreSwitch=true 时
+// 无视账号的 INSTABOX_SNAPSHOT 开关（手动触发 = 管理员明确要做）
+async function rotateSnapshots(c, account, forceLog, ignoreSwitch = false) {
+  const { picked, error } = resolve(c, account);
+  if (error) return { ok: false, kind: "snapshot", at: new Date().toISOString(), error, count: 0, accounts: [] };
+
+  const accounts = [];
+  for (const acc of picked) {
+    if (!acc.snapshot && !ignoreSwitch) {
+      accounts.push({ account: acc.account, ok: true, skipped: "INSTABOX_SNAPSHOT 未开" });
+      continue;
+    }
+    try {
+      accounts.push(await snapshotAccount(acc));
+    } catch (e) {
+      accounts.push({ account: acc.account, ok: false, error: `快照异常：${e.message}` });
+    }
+  }
+  const out = {
+    ok: accounts.length > 0 && accounts.every((a) => a.ok),
+    kind: "snapshot",
+    at: new Date().toISOString(),
+    count: accounts.reduce((n, a) => n + (a.created?.length || 0), 0),
+    accounts,
+  };
+  const deleted = accounts.reduce((n, a) => n + (a.deleted?.length || 0), 0);
+  await logEvent(c, { ...out, count: out.count, deleted }, forceLog);
+  return out;
+}
+
+async function listSnapshots(c, account) {
+  const { picked, error } = resolve(c, account);
+  if (error) return { ok: false, error, accounts: [] };
+  const accounts = [];
+  for (const acc of picked) {
+    try {
+      const r = await call(acc, "GET", "/v1/snapshots");
+      if (!r.ok) {
+        accounts.push({ account: acc.account, ok: false, error: `HTTP ${r.status}` });
+        continue;
+      }
+      accounts.push({
+        account: acc.account,
+        ok: true,
+        snapshots: (r.json?.snapshots || []).map((s) => ({
+          name: s.name,
+          id: s.id,
+          status: s.status,
+          createdAt: s.createdAt,
+          rotating: /^ka-/.test(s.name || ""),
+        })),
+      });
+    } catch (e) {
+      accounts.push({ account: acc.account, ok: false, error: e.message });
+    }
+  }
+  return { ok: accounts.length > 0 && accounts.every((a) => a.ok), accounts };
+}
+
 function accountsView(c) {
   if (!c.accounts.length) return { ok: false, error: "没配账号：加一个 INSTABOX_API_KEY（多账号再加 INSTABOX_API_KEY_2）" };
   return {
@@ -463,10 +667,25 @@ function accountsView(c) {
 }
 
 export default {
-  async scheduled(_event, env) {
-    const out = await keepalive(cfg(env));
+  async scheduled(event, env) {
+    const c = cfg(env);
+    const out = await keepalive(c);
     if (out.ok) console.log("instabox-keepalive:", JSON.stringify(out));
     else console.error("instabox-keepalive:", JSON.stringify(out));
+
+    // 快照轮换：到点（INSTABOX_SNAPSHOT_HOURS 的小时，按 INSTABOX_TZ）才跑；
+    // */9 的 cron 每小时只有 :00 那轮满足 minute<9，天然防重；绑了 KV 的再靠
+    // KV 标记补一次失败重试（:09/:18 那轮还能补上 :00 失败的）。
+    const p = zonedParts(c.tz, event?.scheduledTime ?? Date.now());
+    if (c.snapHours.has(p.hour)) {
+      const stamp = `${p.ymd}${p.hour}`;
+      const done = c.kv ? await c.kv.get("snap-done").catch(() => null) : null;
+      if (p.minute < 9 || done !== stamp) {
+        const r = await rotateSnapshots(c, undefined, false);
+        if (r.ok && c.kv) await c.kv.put("snap-done", stamp).catch(() => {});
+        if (!r.ok) console.error("instabox-keepalive snapshot:", JSON.stringify(r));
+      }
+    }
   },
 
   async fetch(request, env) {
@@ -515,8 +734,18 @@ export default {
       return reply(out, out.ok ? 200 : 502, asText);
     }
 
+    if (route === "/snapshot") {
+      const out = await rotateSnapshots(c, account, true, true); // 手动 = 立即强制做一轮
+      return reply(out, out.ok ? 200 : 502, asText);
+    }
+
+    if (route === "/snapshots") {
+      const out = await listSnapshots(c, account);
+      return reply(out, out.ok ? 200 : 502, asText);
+    }
+
     return reply(
-      { ok: false, error: "用 / 续租、/status 状态、/accounts 账号、/log 日志、/release 放租约" },
+      { ok: false, error: "用 / 续租、/status 状态、/accounts 账号、/log 日志、/release 放租约、/snapshot 快照、/snapshots 快照列表" },
       404,
       asText,
     );
@@ -531,6 +760,19 @@ function reply(body, status, asText) {
       if (a.key) {
         // /accounts
         lines.push(`[#${a.account}] ${a.key} ${(a.machine || []).join(",") || "全部机器"} lease=${a.lease} ttl=${a.ttl}`);
+      } else if (a.snapshots) {
+        // /snapshots
+        lines.push(`[#${a.account}] ${a.ok ? `${a.snapshots.length} 个快照` : a.error}`);
+        for (const s of a.snapshots) {
+          lines.push(`  ${s.name} ${s.status || ""} ${s.createdAt || ""}${s.rotating ? " (轮换)" : ""}`);
+        }
+      } else if (a.created || a.deleted || a.kept !== undefined) {
+        // /snapshot
+        lines.push(
+          `[#${a.account}] 快照 +${(a.created || []).length} -${(a.deleted || []).length} 留${a.kept ?? 0}` +
+            (a.skipped ? ` 跳过：${a.skipped}` : a.ok ? " ok" : ` FAIL ${a.error || ""}`),
+        );
+        for (const n of a.created || []) lines.push(`  + ${n}`);
       } else if (a.error) {
         lines.push(`[#${a.account}] FAIL ${a.error}`);
       }
@@ -549,7 +791,7 @@ function reply(body, status, asText) {
       );
     }
     for (const e of body.entries || []) {
-      lines.push(`${e.at} ok=${e.ok} 续租 ${e.count} 台`);
+      lines.push(`${e.at} ok=${e.ok} ${e.kind === "snapshot" ? `快照 +${e.count} -${e.deleted ?? 0}` : `续租 ${e.count} 台`}`);
     }
     return new Response(lines.join("\n") + "\n", {
       status,

@@ -16,6 +16,9 @@ scenario:
   nolist     GET /v1/machines 返回空列表（测"这把 key 名下没有机器"）
   error      GET /v1/machines 返回 500（测报错路径）
 
+--preset-snapshots 预置一批快照（逗号分隔名字，id 按 sn_0001 顺序生成），
+配合 keepalive.sh --snapshot / worker /snapshot 测轮换裁剪逻辑。
+
 请求日志同时写 stdout 和 --log 文件（一行一个 METHOD PATH STATUS），CI 用它断言。
 """
 import argparse
@@ -108,6 +111,12 @@ class Handler(BaseHTTPRequestHandler):
             note(f"GET {path} 200")
             return self._send(200, {"machines": [machine_obj(ARGS.machine_id, ARGS.machine_name)]})
 
+        if path == "/v1/snapshots":
+            with STATE_LOCK:
+                snaps = list(STATE.get("snapshots", []))
+            note(f"GET {path} 200")
+            return self._send(200, {"snapshots": snaps})
+
         if path.startswith("/v1/machines/"):
             note(f"GET {path} 200")
             return self._send(200, machine_obj(ARGS.machine_id, ARGS.machine_name))
@@ -133,6 +142,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = self.path.split("?")[0]
+        if path.startswith("/v1/snapshots/"):
+            sid = path.rsplit("/", 1)[-1]
+            if not self.headers.get("Idempotency-Key"):
+                note(f"DELETE {path} 400")
+                return self._send(400, {"error": {"code": "bad_request", "message": "Idempotency-Key required"}})
+            with STATE_LOCK:
+                before = len(STATE.get("snapshots", []))
+                STATE["snapshots"] = [s for s in STATE.get("snapshots", []) if s["id"] != sid]
+                removed = before != len(STATE["snapshots"])
+            note(f"DELETE {path} {'204' if removed else '404'}")
+            return self._send(204, {}) if removed else self._send(404, {"error": {"code": "not_found"}})
         if "/activity-leases/" in path:
             note(f"DELETE {path} 204")
             return self._send(204, {})
@@ -144,6 +164,31 @@ class Handler(BaseHTTPRequestHandler):
         if not self.headers.get("Idempotency-Key"):
             note(f"POST {path} 400")
             return self._send(400, {"error": {"code": "bad_request", "message": "Idempotency-Key required"}})
+
+        if path.endswith("/snapshots"):
+            body = self._body()
+            name = (body.get("name") or "").strip()
+            if not name:
+                note(f"POST {path} 400")
+                return self._send(400, {"error": {"code": "bad_request", "message": "name required"}})
+            running = current_state() == "running"  # 先读状态再拿锁，current_state 里也要 STATE_LOCK，锁内再调会死锁
+            with STATE_LOCK:
+                if any(s["name"] == name for s in STATE.get("snapshots", [])):
+                    note(f"POST {path} 409")
+                    return self._send(409, {"error": {"code": "snapshot_name_taken", "message": name}})
+                sn = {
+                    "id": f"sn_{len(STATE.get('snapshots', [])) + 1:04d}",
+                    "name": name,
+                    "sourceMachineId": path.split("/")[3],
+                    "status": "pending" if running else "ready",
+                    "rootSizeBytes": 17179869184,
+                    "dataSizeBytes": 21474836480,
+                    "createdAt": now_iso(),
+                }
+                STATE.setdefault("snapshots", []).append(sn)
+            code = 202 if sn["status"] == "pending" else 201
+            note(f"POST {path} {code} name={name}")
+            return self._send(code, sn)
 
         if path.endswith("/resume"):
             if ARGS.scenario in ("stopped", "dead"):
@@ -180,11 +225,23 @@ def main():
     p.add_argument("--wake-polls", type=int, default=0,
                    help="唤醒后需要多少次 GET 才变 running（默认 0=下一次 GET 就是 running）")
     p.add_argument("--require-key", action="store_true", help="没带 X-API-Key 就 401")
+    p.add_argument("--preset-snapshots", default="",
+                   help="预置快照名（逗号分隔），如 ka-20261020-0800-x1,ka-20261021-2000-x1")
     p.add_argument("--log", default="")
     ARGS = p.parse_args()
 
     initial = {"suspended": "suspended", "stopped": "stopped", "dead": "suspended"}.get(ARGS.scenario, "running")
-    STATE = {"state": initial, "waking": False, "polls": ARGS.wake_polls}
+    STATE = {"state": initial, "waking": False, "polls": ARGS.wake_polls, "snapshots": []}
+    for i, nm in enumerate([s.strip() for s in ARGS.preset_snapshots.split(",") if s.strip()], 1):
+        STATE["snapshots"].append({
+            "id": f"sn_{i:04d}",
+            "name": nm,
+            "sourceMachineId": ARGS.machine_id,
+            "status": "ready",
+            "rootSizeBytes": 17179869184,
+            "dataSizeBytes": 21474836480,
+            "createdAt": now_iso(),
+        })
 
     srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     # --port 0 表示让内核挑一个空闲端口，再把真实端口打出来给调用方读

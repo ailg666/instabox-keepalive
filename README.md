@@ -4,7 +4,7 @@
 
 > **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。所以只能用租约这条官方口子。
 
-> 想用官方 `instabox` CLI 手动建机 / 进机 / 快照 / 开端口——见 [docs/CLI.md](docs/CLI.md)（CLI 操作手册）。
+> 想用官方 `instabox` CLI 手动建机 / 进机 / 快照 / 开端口——见 [docs/CLI.md](docs/CLI.md)（CLI 操作手册）。三种跑法还都内置了**可选的自动快照轮换**（见《快照轮换》一章），保活的同时顺手做灾备。
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**、靠那次出网请求带出去 —— 这也是 Worker 版要放到 Cloudflare 的原因；`keepalive.sh` 装在你自己的常开机器上，同样满足。
 
@@ -72,6 +72,8 @@ sh /root/instabox-keepalive/keepalive.sh uninstall   # 彻底卸载（停服务�
 | `INSTABOX_LEASE_TTL` | `300` | 秒，30–3600 |
 | `INSTABOX_RENEW_EVERY` | `0.6 × ttl` | 续租间隔 |
 | `INSTABOX_AUTO_RESUME` | `1` | 遇 409 先 resume（stopped 用 start 兜底）再续；`0` 只报错不唤醒 |
+| `INSTABOX_SNAPSHOT` | `0` | `1`=到点自动快照轮换（见《快照轮换》一章） |
+| `INSTABOX_SNAPSHOT_HOURS` | `1,13` | 快照小时（上海时区逗号分隔） |
 | `INSTABOX_WAKE_GAP` / `INSTABOX_WAKE_TRIES` | `5` / `3` | 唤醒后轮询间隔/次数 |
 | `INSTABOX_API_URL` | `https://api.instabox.sh` | 换私有网关时才用 |
 
@@ -134,6 +136,40 @@ INSTABOX_API_KEY_2 = ibk_xxx      # 占死 2 号位；任务变成 1=aaa 2=xxx 3
 ```
 
 反过来，如果几个账号都只想保活同名的那台机器（比如都叫 `qqq`）：Worker 只写 `INSTABOX_MACHINE=qqq`，脚本写 `machine=qqq`，所有账号都会继承这个筛选。
+
+## 快照轮换（可选）：保活的同时自动灾备
+
+机器被误删、账号被封时，快照是唯一能救回来的手段（`instabox create --name 新名字 --snapshot 快照名` 即可重建环境）。三种跑法都内置了同一套轮换逻辑，**默认关**，一行配置打开：
+
+**轮换策略（GFS）**：每天 2 个快照点（默认 8 点 / 20 点，隔 12 小时），到点对每台选中机器建 `ka-YYYYMMDD-HHMM-<机器id后6位>`，并自动裁剪旧的——稳态正好 5 个（免费版全额度）：
+
+- 当天 2 个（早/晚各一）+ 前 3 天各 1 个
+- 早上那轮删「昨天 2 份中较旧的」，晚上那轮删「最老的那份（4 天前）」
+- 只动 `ka-` 前缀的快照，你手动建的其它快照永不碰
+- 删到额度-1 再建，永不超额；创建被拒（额度/存储池满）会自动删最老的那个腾位重试
+- 错过时间点、手动补跑都能自动收敛回目标状态
+
+**手动快照和脚本怎么互不干扰**：额度是账号级的（免费版 5 个全前缀共享）。你手动建的非 `ka-` 快照**永远不会被脚本删**，但它们会占用额度——手动建 2 个，`ka-` 最多就只剩 3 个，脚本自动收敛到 3 个的轮换；手动建满 5 个，脚本创建会失败并如实报错（保活不受影响），删掉一个手动快照后下一轮自动恢复。唯一约定：**手动快照别用 `ka-` 前缀命名**（会被当成轮换成员参与裁剪）。随时手动跑 `--snapshot` / `/snapshot` 补一轮完全无害，同分钟重跑幂等。
+
+**三种跑法怎么开**（能力完全一致）：
+
+| 跑法 | 开启方式 | 到点触发机制 |
+| --- | --- | --- |
+| VPS/NAS 脚本 | 安装时加 `--snapshot`（或 `snapshot=1`）；已装的改 `.env` 后重跑安装 | systemd/OpenRC 的 watch 循环内置判断（按 `INSTABOX_SNAPSHOT_TZ`，默认上海，装在海外机器也不用换算小时）；cron 模式自动加一条**每小时整点**的检查条目，到不到点由脚本按 `SNAP_TZ` 实时判断——宿主机时区/夏令时都不影响 |
+| Docker | `.env` 里 `INSTABOX_SNAPSHOT=1` | 容器里跑的就是 watch 模式，同上 |
+| Worker | 面板加变量 `INSTABOX_SNAPSHOT`=`1`（Text） | 还是一条 `*/9` cron：到点的那一轮自动顺带做快照（`:00` 那轮触发，天然防重；绑了 KV 的失败还能在后面几轮补上） |
+
+手动立即做一轮 / 看列表：脚本 `sh keepalive.sh --snapshot`；Worker `GET /snapshot?token=...`（强制执行，不受开关限制）和 `GET /snapshots?token=...`（列出全部快照，`ka-` 前缀标「轮换」）。
+
+**变量**（三种跑法同名通用；小时数一律按上海时区解释：脚本用 `INSTABOX_SNAPSHOT_TZ`（默认 `Asia/Shanghai`），Worker 用 `INSTABOX_TZ`；Docker 镜像已内置 `TZ=Asia/Shanghai`）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `INSTABOX_SNAPSHOT` | `0` | `1`=到点自动快照轮换；安装时 `--snapshot` / `--no-snapshot` 显式开关 |
+| `INSTABOX_SNAPSHOT_HOURS` | `1,13` | 快照小时（上海时区，逗号分隔，建议隔 12 小时） |
+| `INSTABOX_SNAPSHOT_MAX` | `5` | `ka-` 快照总额度；免费版 5 个正好，付费版可调大 |
+
+**快照能恢复什么**：全部文件（系统盘 + `/data`）和登录态；**不含**内存和运行中的进程，恢复后是新机器（id 变了、公网端口 URL 要重新 publish）。免费版 200 GiB 存储池 = 快照 + 机器文件共用的总额度，`/data` 实际用量很大时留意 `GET /v1/usage`。
 
 ## Docker 部署（NAS / 群晖 / 1Panel）
 

@@ -15,6 +15,8 @@
 #     sh keepalive.sh --watch      前台常驻（systemd / OpenRC 用这个）
 #     sh keepalive.sh --status     机器状态
 #     sh keepalive.sh --release    释放租约，恢复正常空闲挂起
+#     sh keepalive.sh --snapshot   立即做一轮快照轮换（建新的 + 删旧的，不看时间点）
+#     sh keepalive.sh --snapshot-auto  cron 内部用：到点才做（每小时被 cron 唤醒，按 SNAP_TZ 判断）
 #
 #   安装参数（也能写成环境变量）
 #     key= / KEY= / INSTABOX_API_KEY=  API key（必填）
@@ -26,11 +28,18 @@
 #     --raw URL        raw 前缀，脚本自更新用     （默认本仓库 main）
 #     --no-start       只装不启
 #     --cron           强制走 cron（不用 systemd / OpenRC）
+#     --snapshot       打开快照轮换（默认沿用 .env 里的旧值，没有则关）
+#     --no-snapshot    明确关掉快照轮换
+#     --snapshot-hours H  快照小时（默认 1,13，上海时区）
 #
 #   运行期变量（.env 或环境变量；环境变量优先）
 #     INSTABOX_ENV_FILE      .env 路径（默认脚本同目录）
 #     INSTABOX_RENEW_EVERY   两次续租的间隔秒数（默认租约的 3/5）
 #     INSTABOX_AUTO_RESUME   1（默认）：机器被挂起/停掉时先 resume（stopped 用 start 兜底）再续租；0=只报错不唤醒
+#     INSTABOX_SNAPSHOT      1=到点自动快照轮换（watch 模式按小时点触发，cron 模式装独立条目）；0=关（默认）
+#     INSTABOX_SNAPSHOT_HOURS 快照小时（按 INSTABOX_SNAPSHOT_TZ 时区，逗号分隔，默认 1,13 = 上海时区凌晨 1 点/下午 13 点）
+#     INSTABOX_SNAPSHOT_TZ   快照时区（默认 Asia/Shanghai；装在海外机器上也不用换算小时数）
+#     INSTABOX_SNAPSHOT_MAX  ka- 前缀快照总额度（默认 5，免费版正好；付费版可调大）
 #     INSTABOX_API_URL       API 地址（默认 https://api.instabox.sh）
 #
 #   多账号：key=ibk_aaa,ibk_bbb,ibk_cc3（逗号分隔，无限叠加；单把也行）
@@ -45,6 +54,9 @@ DIR=$DEF_DIR
 SERVICE=${SERVICE_NAME:-instabox-keepalive}
 LEASE=${INSTABOX_LEASE:-keepalive}
 TTL=${INSTABOX_LEASE_TTL:-300}
+SNAP=${INSTABOX_SNAPSHOT:-0}
+SNAP_HOURS=${INSTABOX_SNAPSHOT_HOURS:-1,13}
+SNAP_TZ=${INSTABOX_SNAPSHOT_TZ:-Asia/Shanghai}
 NAME=${machine:-${INSTABOX_MACHINE:-}}
 API_KEY=${key:-${KEY:-${IBK:-${INSTABOX_API_KEY:-}}}}
 API=${INSTABOX_API_URL:-${api:-https://api.instabox.sh}}
@@ -83,9 +95,18 @@ reload_runtime() { # .env / 环境变量里的值最终生效一次
 	TTL=${INSTABOX_LEASE_TTL:-$TTL}
 	RENEW=${INSTABOX_RENEW_EVERY:-$((TTL * 3 / 5))}
 	AUTO_RESUME=${INSTABOX_AUTO_RESUME:-1}
+	SNAP=${INSTABOX_SNAPSHOT:-$SNAP}
+	SNAP_HOURS=$(norm_snap_hours "${INSTABOX_SNAPSHOT_HOURS:-$SNAP_HOURS}")
+	[ -n "$SNAP_HOURS" ] || SNAP_HOURS=1,13
+	SNAP_TZ=${INSTABOX_SNAPSHOT_TZ:-$SNAP_TZ}
+	[ -n "$SNAP_TZ" ] || SNAP_TZ=Asia/Shanghai
 	ALL=0
 	case "$MACHINE" in ""|all|ALL|All|'*') ALL=1 ;; esac
 	return 0
+}
+
+norm_snap_hours() { # "01, 13" → "1,13"（去空格去前导零，小时 0 保留）
+	printf '%s' "$1" | tr ',' '\n' | sed 's/[[:space:]]//g;s/^0*\([0-9]\)/\1/' | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
 }
 
 HTTP_BODY=
@@ -106,21 +127,32 @@ jget() {
 }
 
 # http <METHOD> <PATH> [JSON_BODY] -> HTTP_CODE + HTTP_BODY
+# 快照等需要 Idempotency-Key 的接口：调用前设 HTTP_IDEM；需要把 201/202 也当成功：设
+# HTTP_EXTRA_OK（如 "201 202"）。两个变量每次调用即被消费，不会影响后续普通调用。
 http() {
 	method=$1
 	path=$2
 	data=${3:-}
+	idem=${HTTP_IDEM:-}
+	extra=" ${HTTP_EXTRA_OK:-} "
+	HTTP_IDEM=
+	HTTP_EXTRA_OK=
+	idem_args=
+	[ -n "$idem" ] && idem_args="-H Idempotency-Key:$idem"
 	if [ -n "$data" ]; then
 		resp=$(curl -sS -m 30 -X "$method" "$API$path" \
-			-H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+			-H "X-API-Key: $KEY" -H 'Content-Type: application/json' $idem_args \
 			-d "$data" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
 	else
 		resp=$(curl -sS -m 30 -X "$method" "$API$path" \
-			-H "X-API-Key: $KEY" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
+			-H "X-API-Key: $KEY" $idem_args -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
 	fi
 	HTTP_CODE=$(printf '%s' "$resp" | tail -n 1)
 	HTTP_BODY=$(printf '%s' "$resp" | sed '$d')
-	[ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]
+	case " 200 204 $extra " in
+		*" $HTTP_CODE "*) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 # 租约接口只认机器 id（传名字会 400），所以名字要先换成 id；`all` 就是把这把 key
@@ -280,6 +312,202 @@ autoSuspendedAt=$(jget "$HTTP_BODY" autoSuspendedAt)"
 	return 0
 }
 
+# ---- 快照轮换 ----------------------------------------------------------------
+# 策略（ka- 前缀的才动，手动建的非 ka- 快照永不碰）：
+#   到点对每台选中机器建 ka-YYYYMMDD-HHMM-<机器id后6位>；建之前先裁剪：
+#   窗口外（≥5 天前）全删；今天+前 4 天共 5 组，各组只留最新 1 个；
+#   删完若仍 ≥ 额度（INSTABOX_SNAPSHOT_MAX，默认 5）再从最老的删到额度-1 腾位。
+# 稳态 = 当天 2 个 + 前 3 天各 1 个，正好用满免费版 5 个额度；
+# 第 1 轮（默认凌晨 1 点）腾位删「昨天 2 份中较旧的」，第 2 轮（下午 13 点）删「4 天前最老那份」。
+# 小时数一律按 INSTABOX_SNAPSHOT_TZ（默认 Asia/Shanghai）解释，与安装机系统时区无关。
+
+ymd_days_ago() { # ymd_days_ago <N> -> N 天前的 YYYYMMDD（按 SNAP_TZ 时区；纯 awk，BusyBox 也能跑）
+	awk -v e="$(( $(date +%s) - $1 * 86400 ))" -v z="$(TZ=${SNAP_TZ:-Asia/Shanghai} date +%z)" 'BEGIN{
+		off = 0
+		if (z ~ /^[+-][0-9][0-9][0-9][0-9]$/) {
+			oh = substr(z, 2, 2) + 0; om = substr(z, 4, 2) + 0
+			off = (substr(z, 1, 1) == "-" ? -1 : 1) * (oh * 3600 + om * 60)
+		}
+		days = int((e + off) / 86400); if (e + off < 0 && (e + off) % 86400 != 0) days--
+		q = days + 719468
+		era = int(q / 146097)
+		doe = q - era * 146097
+		yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+		y = yoe + era * 400
+		doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+		mp = int((5 * doy + 2) / 153)
+		d = doy - int((153 * mp + 2) / 5) + 1
+		m = mp + 3; if (mp >= 10) m = mp - 9
+		if (m <= 2) y++
+		printf "%04d%02d%02d\n", y, m, d
+	}'
+}
+
+snap_date_of() { # "ka-20261027-0800-x1" -> "20261027"（格式不对返回 1）
+	case "$1" in
+		ka-????????-*) printf '%s' "$1" | cut -c4-11 ;;
+		*) return 1 ;;
+	esac
+}
+
+snap_list() { # -> 每行 "id<TAB>name"（只 ka- 开头；jq/python3/awk 三兑底）
+	if command -v jq >/dev/null 2>&1; then
+		printf '%s' "$HTTP_BODY" | jq -r '.snapshots[]? | select((.name // "") | startswith("ka-")) | "\(.id)\t\(.name)"'
+	elif command -v python3 >/dev/null 2>&1; then
+		printf '%s' "$HTTP_BODY" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for s in d.get("snapshots") or []:
+    n = s.get("name", "")
+    if n.startswith("ka-"):
+        print("%s\t%s" % (s.get("id", ""), n))'
+	else
+		printf '%s' "$HTTP_BODY" | awk '
+			function getv(o, k,   s, r) {
+				s = index(o, "\"" k "\": \"")
+				if (s == 0) {
+				s = index(o, "\"" k "\":\"")
+					if (s == 0) { return "" }
+					r = substr(o, s + length(k) + 4)
+				} else {
+					r = substr(o, s + length(k) + 5)
+				}
+				return substr(r, 1, index(r, "\"") - 1)
+			}
+			function emit(o,   id, nm) {
+				id = getv(o, "id"); nm = getv(o, "name")
+				if (id != "" && nm ~ /^ka-/) { print id "\t" nm }
+			}
+			{
+				line = $0
+				if (match(line, /"snapshots"[ 	]*:[ 	]*\[/)) { line = substr(line, RSTART + RLENGTH) } else { line = "" }
+				depth = 0; buf = ""; started = 0
+				for (p = 1; p <= length(line); p++) {
+					c = substr(line, p, 1)
+					if (c == "]") { if (depth == 0 && started == 1) { break } }
+					if (c == "{") {
+						depth++
+						if (depth == 1) { buf = "{"; started = 1 } else { buf = buf c }
+					} else {
+						if (c == "}") {
+							if (depth == 1) { emit(buf "}"); buf = "" } else { if (depth > 1) { buf = buf c } }
+							depth--
+					} else {
+							if (depth >= 1) { buf = buf c }
+						}
+					}
+				}
+			}'
+	fi
+}
+
+snap_delete_one() { # snap_delete_one <snapshot-id> <name>
+	HTTP_IDEM="ka-del-$1-$$-$(date +%s)"
+	if http DELETE "/v1/snapshots/$1"; then
+		log "删旧快照 $2"
+		return 0
+	fi
+	log "删旧快照失败 $2 HTTP $HTTP_CODE: $HTTP_BODY"
+	return 1
+}
+
+del_oldest_kasnap() { # 删最老的一个 ka- 快照（创建被额度拒时的兑底）
+	http GET /v1/snapshots || return 1
+	oldest=$(snap_list | sort -k2,2 | head -n 1)
+	[ -n "$oldest" ] || return 1
+	sid=$(printf '%s' "$oldest" | cut -f1)
+	sname=$(printf '%s' "$oldest" | cut -f2)
+	[ -n "$sid" ] || return 1
+	snap_delete_one "$sid" "$sname"
+}
+
+prune_snaps() { # 每把 key：列 ka- 快照 → 算删除名单 → 删（创建前执行，保证不超额）
+	http GET /v1/snapshots || { log "列快照失败 HTTP $HTTP_CODE: $HTTP_BODY"; return 1; }
+	list=$(snap_list) || { log "解析快照列表失败"; return 1; }
+	[ -n "$list" ] || return 0
+	t0=$(ymd_days_ago 0); t1=$(ymd_days_ago 1); t2=$(ymd_days_ago 2); t3=$(ymd_days_ago 3); t4=$(ymd_days_ago 4)
+	max=${INSTABOX_SNAPSHOT_MAX:-5}
+	del_list=$(printf '%s\n' "$list" | while IFS='	' read -r sid sname; do
+		[ -n "$sid" ] || continue
+		d=$(snap_date_of "$sname") || d=00000000
+		printf '%s\t%s\t%s\n' "$d" "$sname" "$sid"
+	done | sort | awk -F'\t' -v t0="$t0" -v t1="$t1" -v t2="$t2" -v t3="$t3" -v t4="$t4" -v max="$max" '
+		{ rows[NR] = $0; d[NR] = $1; n = NR }
+		END {
+			if (n == 0) exit
+			# 窗口 5 组（今天 + 前 4 天），组内留最新：从新到旧扫，每组第一个标记保留
+			for (i = n; i >= 1; i--) { if (!(d[i] in last)) last[d[i]] = i }
+			k = 0
+			for (i = 1; i <= n; i++) {
+				ok = (d[i] == t0 || d[i] == t1 || d[i] == t2 || d[i] == t3 || d[i] == t4) && (last[d[i]] == i)
+				if (ok) { keep[++k] = rows[i] } else { print rows[i] }
+			}
+			# 额度兑底：删到 max-1 个，给新建的腾位（早上删昨旧、晚上删最老，都由这条兑出来）
+			for (i = 1; i <= k; i++) { if (i <= k - (max - 1)) print keep[i] }
+		}')
+	[ -n "$del_list" ] || return 0
+	printf '%s\n' "$del_list" | while IFS='	' read -r d sname sid; do
+		[ -n "$sid" ] || continue
+		snap_delete_one "$sid" "$sname" || true
+	done
+	return 0
+}
+
+snap_create_one() { # snap_create_one <id> <label>
+	tail6=$(printf '%s' "$1" | tr -cd 'a-z0-9' | tail -c 6)
+	sname="ka-$(TZ=${SNAP_TZ:-Asia/Shanghai} date +%Y%m%d-%H%M)-$tail6"
+	HTTP_IDEM="ka-snap-$1-$$-$(date +%s)"
+	HTTP_EXTRA_OK="201 202"
+	if http POST "/v1/machines/$1/snapshots" "{\"name\":\"$sname\"}"; then
+		log "快照 ok $2 → $sname"
+		return 0
+	fi
+	if [ "$HTTP_CODE" = "409" ] && printf '%s' "$HTTP_BODY" | grep -Eqi 'taken|exists|duplicate'; then
+		log "快照已存在 $sname（本轮做过了，当成功）"
+		return 0
+	fi
+	if [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "409" ]; then
+		if del_oldest_kasnap; then
+			HTTP_IDEM="ka-snap-$1-$$-$(date +%s)r"
+			HTTP_EXTRA_OK="201 202"
+			if http POST "/v1/machines/$1/snapshots" "{\"name\":\"$sname\"}"; then
+				log "快照 ok（腾位后）$2 → $sname"
+				return 0
+			fi
+		fi
+	fi
+	log "快照失败 $2 HTTP $HTTP_CODE: $HTTP_BODY"
+	return 1
+}
+
+snapshot_round() { # 每把 key 一轮：先裁剪腾位，再对每台选中机器建快照
+	preflight_nocall && resolve || return 1
+	prune_snaps || log "本轮裁剪跳过（列快照失败），直接尝试创建"
+	each_machine snap_create_one
+}
+
+snapshot() { each_key snapshot_round; }
+
+maybe_snapshot() { # 到了快照小时（按 SNAP_TZ）且这个小时没做成功过才做；watch 循环和 cron 的 --snapshot-auto 都走这里
+	[ "$SNAP" = "1" ] || return 0
+	h=$(TZ=${SNAP_TZ:-Asia/Shanghai} date +%H | sed 's/^0*\([0-9]\)/\1/')
+	case ",$SNAP_HOURS," in
+		*",$h,"*) : ;;
+		*) return 0 ;;
+	esac
+	stamp=$(TZ=${SNAP_TZ:-Asia/Shanghai} date +%Y%m%d%H)
+	state=$(dirname "$ENV_FILE")/.snapshot-state
+	if [ -f "$state" ] && [ "$(cat "$state" 2>/dev/null)" = "$stamp" ]; then
+		return 0
+	fi
+	out=$(snapshot 2>&1)
+	printf '%s\n' "$out"
+	# 本轮没有任何失败才记 state：失败的话下个小时（cron 模式）或下一轮（watch 模式）自动重试
+	case "$out" in *快照失败*) return 1 ;; esac
+	printf '%s\n' "$stamp" > "$state" 2>/dev/null
+	return 0
+}
+
 each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 	fn=$1
 	if [ "$ALL" -eq 0 ]; then
@@ -376,8 +604,10 @@ run_watch() { # 常驻（systemd / OpenRC 用）
 	preflight
 	if [ "$ALL" -eq 1 ]; then TARGET="全部机器（按 key 自动发现）"; else TARGET=$LABEL; fi
 	log "watch: 每 ${RENEW}s 续租 $TARGET/$LEASE（ttl ${TTL}s），API $API"
+	[ "$SNAP" = "1" ] && log "watch: 快照轮换已开（$SNAP_TZ 每天 $SNAP_HOURS 点，ka- 前缀：当天留 2、前 3 天各 1）"
 	while :; do
 		renew || log "这一轮有失败，下一轮再试"
+		maybe_snapshot
 		sleep "$RENEW"
 	done
 }
@@ -412,6 +642,12 @@ do_install() {
 			--api) API=${1:-}; [ "$#" -gt 0 ] && shift ;;
 			--no-start) WANT_START=0 ;;
 			--cron) FORCE_CRON=1 ;;
+			--snapshot) SNAP=1; SNAP_GIVEN=1 ;;
+			--no-snapshot) SNAP=0; SNAP_GIVEN=1 ;;
+			--snapshot-hours=*) SNAP_HOURS=${a#*=} ;;
+			--snapshot-hours) SNAP_HOURS=${1:-}; [ "$#" -gt 0 ] && shift ;;
+			snapshot=*) SNAP=${a#*=}; SNAP_GIVEN=1 ;;
+			snapshot-hours=*) SNAP_HOURS=${a#*=} ;;
 			install) : ;;
 			-h|--help) usage; exit 0 ;;
 			*) die "未知安装参数: $a（看 --help）" ;;
@@ -423,12 +659,21 @@ do_install() {
 		API_KEY=$(sed -n 's/^INSTABOX_API_KEY=//p' "$DIR/.env" | head -n 1)
 		[ -n "$NAME" ] || NAME=$(sed -n 's/^INSTABOX_MACHINE=//p' "$DIR/.env" | head -n 1)
 	fi
+	# 快照开关/小时同理：没显式给就沿用 .env 里的旧值，升级重装不丢配置
+	if [ "${SNAP_GIVEN:-0}" -ne 1 ] && [ -f "$DIR/.env" ]; then
+		case "$(sed -n 's/^INSTABOX_SNAPSHOT=//p' "$DIR/.env" | head -n 1)" in
+			1|true|on) SNAP=1 ;;
+			0|false|off) SNAP=0 ;;
+		esac
+		v=$(sed -n 's/^INSTABOX_SNAPSHOT_HOURS=//p' "$DIR/.env" | head -n 1)
+		[ -n "$v" ] && SNAP_HOURS=$v
+	fi
 	[ -n "$API_KEY" ] || die "缺 key。用法： key=你的KEY bash <(curl -Ls $RAW/keepalive.sh)"
 
 	case "$TTL" in ''|*[!0-9]*) die "TTL 必须是数字: $TTL" ;; esac
 	if [ "$TTL" -lt 30 ] || [ "$TTL" -gt 3600 ]; then die "TTL 必须在 30-3600 秒之间"; fi
 
-	log "安装参数：key=$(mask "$API_KEY") machine=${NAME:-全部} lease=$LEASE ttl=${TTL}s dir=$DIR"
+	log "安装参数：key=$(mask "$API_KEY") machine=${NAME:-全部} lease=$LEASE ttl=${TTL}s snapshot=$SNAP($SNAP_HOURS 点) dir=$DIR"
 
 	if ! command -v curl >/dev/null 2>&1; then
 		log "装 curl"
@@ -464,6 +709,9 @@ do_install() {
 		printf 'INSTABOX_MACHINE=%s\n' "$NAME"
 		printf 'INSTABOX_LEASE=%s\n' "$LEASE"
 		printf 'INSTABOX_LEASE_TTL=%s\n' "$TTL"
+		printf 'INSTABOX_SNAPSHOT=%s\n' "$SNAP"
+		printf 'INSTABOX_SNAPSHOT_HOURS=%s\n' "$(norm_snap_hours "$SNAP_HOURS")"
+		printf 'INSTABOX_SNAPSHOT_TZ=%s\n' "$SNAP_TZ"
 	} > "$DIR/.env" || die "写 $DIR/.env 失败"
 	chmod 600 "$DIR/.env"
 	printf '%s\n' '.env' 'install.conf' > "$DIR/.gitignore"
@@ -538,8 +786,18 @@ EOF_INIT
 				*) schedule="*/$interval_min * * * *" ;;
 			esac
 			line="$schedule INSTABOX_ENV_FILE=$DIR/.env /bin/sh $DIR/keepalive.sh --once >/dev/null 2>&1"
-			( crontab -l 2>/dev/null | grep -vF "$DIR/keepalive.sh"; printf '%s\n' "$line" ) | crontab - || die "写 crontab 失败"
+			( crontab -l 2>/dev/null | grep -vF "$DIR/keepalive.sh"
+			  printf '%s\n' "$line"
+			  if [ "$SNAP" = "1" ]; then
+			  	# 每小时整点唤醒一次 --snapshot-auto，到不到点由脚本按 SNAP_TZ 实时判断：
+			  	# 宿主机什么时区、有没有夏令时都不影响，也无需静态换算 cron 表达式
+			  	printf '0 * * * * INSTABOX_ENV_FILE=%s /bin/sh %s --snapshot-auto >>%s/snapshot.log 2>&1\n' "$DIR/.env" "$DIR/keepalive.sh" "$DIR"
+			  fi
+			) | crontab - || die "写 crontab 失败"
 			say "cron 已装：$schedule（每 $interval_min 分钟一次）"
+			if [ "$SNAP" = "1" ]; then
+				say "快照 cron 已装：每小时整点检查一次，到 $(norm_snap_hours "$SNAP_HOURS") 点（$SNAP_TZ）才真正做（日志 $DIR/snapshot.log）"
+			fi
 			;;
 	esac
 
@@ -552,6 +810,9 @@ EOF_INIT
 	say "看状态： sh $DIR/keepalive.sh --status"
 	say "卸载：   sh $DIR/keepalive.sh uninstall"
 	say "手动续租一次： sh $DIR/keepalive.sh --once"
+	if [ "$SNAP" = "1" ]; then
+		say "手动做一轮快照： sh $DIR/keepalive.sh --snapshot"
+	fi
 }
 
 # ---- 卸载 --------------------------------------------------------------------
@@ -659,8 +920,20 @@ case "${1:-}" in
 		reload_runtime
 		release
 		;;
+	--snapshot|-S)
+		load_env "$SELF_DIR"
+		reload_runtime
+		snapshot
+		;;
+	--snapshot-auto)
+		# cron 内部用：每小时被 crontab 唤醒一次，脚本自己按 SNAP_TZ 判断到不到点、
+		# 这个小时做没做过——宿主机什么时区、有没有夏令时都不影响，也不用静态换算 cron 表达式
+		load_env "$SELF_DIR"
+		reload_runtime
+		maybe_snapshot
+		;;
 	-h|--help|help) usage ;;
-	key=*|KEY=*|machine=*|INSTABOX_*=*|--lease*|--ttl*|--dir*|--service*|--raw*|--api*|--no-start|--cron)
+	key=*|KEY=*|machine=*|INSTABOX_*=*|snapshot=*|snapshot-hours=*|--lease*|--ttl*|--dir*|--service*|--raw*|--api*|--snapshot*|--no-snapshot|--no-start|--cron)
 		do_install "$@"
 		;;
 	'')

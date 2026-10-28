@@ -15,6 +15,13 @@ INSTABOX_LEASE = "keepalive"
 INSTABOX_LEASE_TTL = "900"
 # 写 KV 的频次，免费额度每天 1000 次写：hourly 每小时最多 1 条（~24/天）、every 每次都写、off 不写
 INSTABOX_LOG_MODE = "hourly"
+# 快照轮换（默认关）："1" 后 cron 到点自动建 ka- 快照并按「当天 2 + 前 3 天各 1」GFS 轮换；
+# 到点小时见 INSTABOX_SNAPSHOT_HOURS，时区 INSTABOX_TZ（默认 Asia/Shanghai）。
+# 手动触发/看列表： /snapshot?token=... 和 /snapshots?token=...（不受开关限制）
+INSTABOX_SNAPSHOT = "0"
+# 快照小时（按 INSTABOX_TZ 时区，默认 Asia/Shanghai；1 和 13 正好隔 12 小时）
+INSTABOX_SNAPSHOT_HOURS = "1,13"
+INSTABOX_SNAPSHOT_MAX = "5"
 # 机器被挂起/停掉后续租会 409 machine_not_running：默认先 resume（stopped 用 start 兜底）再续租，设 0 关掉
 INSTABOX_AUTO_RESUME = "1"
 # 多账号：第 N 个账号 = 单账号变量名加 _N 后缀，加一个账号就多存一个 secret（别把 key 写进这个文件）：
