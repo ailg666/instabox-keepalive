@@ -6,7 +6,10 @@
 FROM alpine:3.22
 
 # keepalive.sh 只依赖 curl；jq 用来解析 /v1/machines，没有时脚本会自己退回 awk
-RUN apk add --no-cache curl jq ca-certificates tzdata \
+# apk 源换成阿里云镜像：官方 CDN dl-cdn.alpinelinux.org 国内直连经常被干扰
+# （现象：fetch 卡 60s 后 Permission denied，全部包 no such package）
+RUN sed -i 's#https://dl-cdn.alpinelinux.org/alpine#https://mirrors.aliyun.com/alpine#g' /etc/apk/repositories \
+	&& apk add --no-cache curl jq ca-certificates tzdata \
 	&& rm -rf /var/cache/apk/*
 
 COPY keepalive.sh /opt/instabox-keepalive/keepalive.sh
