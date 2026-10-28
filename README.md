@@ -32,18 +32,21 @@
 
 ```sh
 # 保活名下全部机器（有几台保几台，机器名都不用填）
-key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh)
+key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh) install
+
+# 保活 + 自动快照轮换（推荐：多两个字就有灾备 —— 当天 2 + 前 3 天各 1，见《快照轮换》）
+key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh) install --snapshot
 
 # 只保某一台
-key=ibk_xxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh)
+key=ibk_xxx machine=qqq bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh) install
 
 # 非 root： curl -Ls <同一个地址> | sudo -E env key=ibk_xxx machine=qqq sh
 
 # 多账号：key 逗号分隔多把，每把 key 各保各的，无限叠加、单个也能跑
-key=ibk_aaa,ibk_bbb,ibk_ccc bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh)
+key=ibk_aaa,ibk_bbb,ibk_ccc bash <(curl -Ls https://raw.githubusercontent.com/ailg666/instabox-keepalive/main/keepalive.sh) install --snapshot
 ```
 
-就一个文件：不带参数＝安装/更新，`uninstall`＝卸载，`--once` / `--watch` / `--status` / `--release`＝手动用，`--help` 看全部参数。装完会立刻做一次续租自检，失败就不装；服务形式按系统自动挑 **systemd → OpenRC → cron**。
+就一个文件：不带参数＝安装/更新，`uninstall`＝卸载，`--once` / `--watch` / `--status` / `--release` / `--snapshot`（手动做一轮快照轮换）＝手动用，`--help` 看全部参数。装完会立刻做一次续租自检，失败就不装；服务形式按系统自动挑 **systemd → OpenRC → cron**。
 
 想升级直接再跑一次安装命令（按现有 `.env` 重装，key 不会丢）；以后加账号就是往 `.env` 的 `INSTABOX_API_KEY` 后面续 `,ibk_xxx`。
 
