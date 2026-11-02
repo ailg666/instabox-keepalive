@@ -288,9 +288,11 @@ async function logEvent(c, entry, force) {
 const lease = (c, id) =>
   call(c, "PUT", `/v1/machines/${id}/activity-leases/${c.lease}`, { ttlSeconds: c.ttl });
 
-// 409 machine_not_running：机器被平台挂起（suspended）或停掉了，续租对它是无效的
+// 409 machine_not_running：机器被平台挂起（suspended）或停掉了，续租对它是无效的；
+// machine_cooldown：免费版 8h max-run 后的冷却期（实测可达 2 小时+，远超文档的 5-20 分钟）——
+// 也纳入唤醒路径：冷却中 resume 会被拒但无害，冷却结束后的下一轮就能自动唤醒恢复
 const isNotRunning = (r) =>
-  r.status === 409 && /not_running|suspended|stopped/i.test(r.text || "");
+  r.status === 409 && /not_running|suspended|stopped|cooldown|cooling/i.test(r.text || "");
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 

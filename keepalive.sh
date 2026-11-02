@@ -242,9 +242,11 @@ preflight() {
 
 # 机器被平台挂起（suspended）或停掉了：续租一律 409 machine_not_running，光续租是空转，
 # 得先唤醒。wake_action 用带 Idempotency-Key 的 POST（换状态的接口缺这个头会 400）。
+# machine_cooldown（8h max-run 后的冷却，实测可达 2h+）也走唤醒路径：冷却中 resume 会被拒
+# 但无害，冷却结束后的下一轮自动唤醒恢复。
 is_not_running() {
 	[ "$HTTP_CODE" = "409" ] || return 1
-	printf '%s' "$HTTP_BODY" | grep -Eqi 'not_running|suspended|stopped'
+	printf '%s' "$HTTP_BODY" | grep -Eqi 'not_running|suspended|stopped|cooldown|cooling'
 }
 
 wake_action() { # wake_action <id> <resume|start> -> 打印 HTTP 码

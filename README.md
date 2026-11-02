@@ -258,9 +258,11 @@ docker exec instabox-keepalive sh /opt/instabox-keepalive/keepalive.sh --status
 
 ## 免费版的 8 小时 max-run（保活也绕不开，但能自动循环）
 
-免费版机器单次连续运行上限固定 **480 分钟（8 小时）**（官方 limits 文档：`Max run | Free: 480 minutes at a time, fixed`）。到点后**无论多忙、无论有没有租约**都会被平台强制挂起——官方 idle-suspend 文档原话："activity and leases do not extend it"。随后有 **5–20 分钟冷却期**，期间任何唤醒（exec/SSH/端口访问/resume/start）都被 `409 machine_cooldown` 拒绝；冷却结束后即可正常唤醒，并**重新计算下一个 8 小时**。
+免费版机器单次连续运行上限固定 **480 分钟（8 小时）**（官方 limits 文档：`Max run | Free: 480 minutes at a time, fixed`）。到点后**无论多忙、无论有没有租约**都会被平台强制挂起——官方 idle-suspend 文档原话："activity and leases do not extend it"。随后进入冷却期，期间任何唤醒（exec/SSH/端口访问/resume/start）都被 `409 machine_cooldown` 拒绝；冷却结束后即可正常唤醒，并**重新计算下一个 8 小时**。
 
-本项目的价值是让这个循环**全自动**：冷却期内续租会撞 409，脚本的自动唤醒（`INSTABOX_AUTO_RESUME=1`，默认开）会在冷却结束后自动 resume 并继续续租——机器以约「8 小时运行 + 最多 20 分钟冷却」的节奏循环，每天自动恢复 2–3 次，无需人工干预。冷却中的 409 是预期现象，日志里看到后等下一轮即可。
+> 冷却时长以实测为准：文档写 5–20 分钟，实测一例为 **2 小时 4 分**（`autoSuspendedAt` 08:50 → `cooldownUntil` 10:54）。机器对象里的 `cooldownUntil` 字段是权威答案，`instabox get` / `GET /v1/machines/{id}` 都能看。
+
+本项目的价值是让这个循环**全自动**：冷却期内续租会撞 409，脚本的自动唤醒（`INSTABOX_AUTO_RESUME=1`，默认开）会把 `machine_cooldown` 也当"需要唤醒"处理——冷却中 resume 被拒但无害，冷却结束后的下一轮自动 resume 并继续续租，无需人工干预。冷却中的 409 是预期现象，日志里看到后等 `cooldownUntil` 过后即可。
 
 要让机器真正 7×24 不停，只能升级付费版（`maxRunMinutes = -1`，Pro 默认即无限）。
 
