@@ -256,6 +256,14 @@ docker exec instabox-keepalive sh /opt/instabox-keepalive/keepalive.sh --status
 - 机器名由你创建机器时指定（`instabox ls` 或网页面板都能看到）
 - 租约是**每台机器各一份**，名字相同也不会互相干扰
 
+## 免费版的 8 小时 max-run（保活也绕不开，但能自动循环）
+
+免费版机器单次连续运行上限固定 **480 分钟（8 小时）**（官方 limits 文档：`Max run | Free: 480 minutes at a time, fixed`）。到点后**无论多忙、无论有没有租约**都会被平台强制挂起——官方 idle-suspend 文档原话："activity and leases do not extend it"。随后有 **5–20 分钟冷却期**，期间任何唤醒（exec/SSH/端口访问/resume/start）都被 `409 machine_cooldown` 拒绝；冷却结束后即可正常唤醒，并**重新计算下一个 8 小时**。
+
+本项目的价值是让这个循环**全自动**：冷却期内续租会撞 409，脚本的自动唤醒（`INSTABOX_AUTO_RESUME=1`，默认开）会在冷却结束后自动 resume 并继续续租——机器以约「8 小时运行 + 最多 20 分钟冷却」的节奏循环，每天自动恢复 2–3 次，无需人工干预。冷却中的 409 是预期现象，日志里看到后等下一轮即可。
+
+要让机器真正 7×24 不停，只能升级付费版（`maxRunMinutes = -1`，Pro 默认即无限）。
+
 ## 机器被挂起/停掉会怎样
 
 续租对 `suspended` / `stopped` 的机器一律回 `409 machine_not_running`——光续租是空转，机器不会自己醒。默认 `INSTABOX_AUTO_RESUME=1`：碰到这个错就先 `POST /resume`（`stopped` 的用 `/start` 兜底），等它变成 `running` 再立刻续租；日志里这条会带 `"resumed":true` 和 `"wake":["resume:202"]`。设成 `0` 就只报错、不唤醒。
